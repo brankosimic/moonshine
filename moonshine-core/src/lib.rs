@@ -5,6 +5,7 @@ pub mod app_scanner;
 pub mod clients;
 pub mod config;
 pub(crate) mod crypto;
+pub mod desktop_streaming;
 pub mod discovery;
 pub mod healthcheck;
 pub mod rtsp;

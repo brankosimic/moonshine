@@ -4,19 +4,20 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::ShutdownReason;
-use crate::session::FrameStats;
-use crate::session::InitializedSession;
-use crate::session::SessionContext;
-use crate::session::SessionKeyData;
-use crate::session::SessionKeys;
-use crate::session::SessionKeysSender;
-use crate::session::SessionState;
-use crate::session::compositor::CompositorConfig;
-use crate::session::stream::audio::AudioStreamConfig;
-use crate::session::stream::audio::AudioStreamContext;
-use crate::session::stream::control::ControlStreamConfig;
-use crate::session::stream::video::VideoStreamConfig;
-use crate::session::stream::video::VideoStreamContext;
+use super::FrameStats;
+use super::InitializedSession;
+use super::SessionContext;
+use super::SessionKeyData;
+use super::SessionKeys;
+use super::SessionKeysSender;
+use super::SessionState;
+use super::desktop_session;
+use super::compositor::CompositorConfig;
+use super::stream::audio::AudioStreamConfig;
+use super::stream::audio::AudioStreamContext;
+use super::stream::control::ControlStreamConfig;
+use super::stream::video::VideoStreamConfig;
+use super::stream::video::VideoStreamContext;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
@@ -44,6 +45,8 @@ pub enum SessionShutdownReason {
 	InputHandlerStopped,
 	/// Compositor stopped unexpectedly.
 	CompositorStopped,
+	/// Desktop capture stream stopped unexpectedly.
+	DesktopStreamStopped,
 }
 
 struct SessionManagerInner {
@@ -228,17 +231,17 @@ impl SessionManager {
 	) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
 		match guard.session.as_ref() {
-			Some(SessionState::Launched(_)) => {
+			Some(SessionState::Launched(_)) | Some(SessionState::DesktopLaunched(_)) => {
 				tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
 				guard.video_stream_context = Some(video_stream_context);
 				guard.audio_stream_context = Some(audio_stream_context);
 				Ok(())
 			},
-			Some(SessionState::Initialized(_)) => {
+			Some(SessionState::Initialized(_)) | Some(SessionState::DesktopInitialized(_)) => {
 				tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
 				Err(())
 			},
-			Some(SessionState::Active(_)) => {
+			Some(SessionState::Active(_)) | Some(SessionState::DesktopActive(_)) => {
 				// Client is resuming an already-running session (reconnect). The video,
 				// audio, and control streams are still running and re-learn the client's
 				// address from its PINGs (with refreshed keys via `/resume`), so there is
@@ -288,18 +291,26 @@ impl SessionManager {
 		let address = guard.address.clone();
 		let stop = guard.stop.clone();
 		let stats_tx = guard.stats_tx.clone();
-		let session = InitializedSession::new(
-			compositor_config,
-			video_config,
-			audio_config,
-			control_config,
-			address,
-			context,
-			stop,
-			stats_tx,
-		)
-		.await?;
-		guard.session = Some(SessionState::Initialized(session));
+		let session = if context.desktop {
+			SessionState::DesktopInitialized(
+				desktop_session::DesktopInitializedSession::new(context, address, stop, stats_tx).await?,
+			)
+		} else {
+			SessionState::Initialized(
+				InitializedSession::new(
+					compositor_config,
+					video_config,
+					audio_config,
+					control_config,
+					address,
+					context,
+					stop,
+					stats_tx,
+				)
+				.await?,
+			)
+		};
+		guard.session = Some(session);
 
 		spawn_session_watchdog(&self.inner, &mut guard);
 		tracing::info!("Session initialized successfully, waiting to be launched.");
@@ -311,17 +322,32 @@ impl SessionManager {
 
 	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
 	pub async fn launch_session(&self) -> Result<(), ()> {
-		let session = {
+		let launched = {
 			let mut guard = self.inner.lock().await;
 			match guard.session.take() {
-				Some(SessionState::Initialized(session)) => session,
+				Some(SessionState::Initialized(session)) => {
+					desktop_session::LaunchedState::Regular(session.launch().await?)
+				},
+				Some(SessionState::DesktopInitialized(session)) => {
+					desktop_session::LaunchedState::Desktop(session.launch().await?)
+				},
 				Some(SessionState::Launched(launched)) => {
 					guard.session = Some(SessionState::Launched(launched));
 					tracing::warn!("LaunchSession rejected: session already launched");
 					return Err(());
 				},
+				Some(SessionState::DesktopLaunched(launched)) => {
+					guard.session = Some(SessionState::DesktopLaunched(launched));
+					tracing::warn!("LaunchSession rejected: session already launched");
+					return Err(());
+				},
 				Some(SessionState::Active(active)) => {
 					guard.session = Some(SessionState::Active(active));
+					tracing::warn!("LaunchSession rejected: session already active");
+					return Err(());
+				},
+				Some(SessionState::DesktopActive(active)) => {
+					guard.session = Some(SessionState::DesktopActive(active));
 					tracing::warn!("LaunchSession rejected: session already active");
 					return Err(());
 				},
@@ -333,20 +359,13 @@ impl SessionManager {
 		};
 
 		tracing::info!("Launching session (starting compositor and app).");
-		match session.launch().await {
-			Ok(launched) => {
-				let mut guard = self.inner.lock().await;
-				guard.session = Some(SessionState::Launched(launched));
-				tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
-				Ok(())
-			},
-			Err(()) => {
-				let mut guard = self.inner.lock().await;
-				guard.reset_session();
-				tracing::error!("Failed to launch session, waiting for new session.");
-				Err(())
-			},
-		}
+		let mut guard = self.inner.lock().await;
+		guard.session = match launched {
+			desktop_session::LaunchedState::Regular(s) => Some(SessionState::Launched(s)),
+			desktop_session::LaunchedState::Desktop(s) => Some(SessionState::DesktopLaunched(s)),
+		};
+		tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
+		Ok(())
 	}
 
 	/// Start the video and audio streams.
@@ -359,11 +378,15 @@ impl SessionManager {
 			let video_stream_context = guard.video_stream_context.take();
 			let audio_stream_context = guard.audio_stream_context.take();
 			match guard.session.take() {
-				Some(SessionState::Launched(launched)) => {
-					(launched, video_stream_context, audio_stream_context, guard.stop.clone())
+				Some(SessionState::Launched(s)) => (desktop_session::LaunchedState::Regular(s), video_stream_context, audio_stream_context, guard.stop.clone()),
+				Some(SessionState::DesktopLaunched(s)) => (desktop_session::LaunchedState::Desktop(s), video_stream_context, audio_stream_context, guard.stop.clone()),
+				Some(SessionState::Initialized(s)) => {
+					guard.session = Some(SessionState::Initialized(s));
+					tracing::warn!("StartSession rejected: session not yet launched");
+					return Err(());
 				},
-				Some(SessionState::Initialized(session)) => {
-					guard.session = Some(SessionState::Initialized(session));
+				Some(SessionState::DesktopInitialized(s)) => {
+					guard.session = Some(SessionState::DesktopInitialized(s));
 					tracing::warn!("StartSession rejected: session not yet launched");
 					return Err(());
 				},
@@ -376,6 +399,14 @@ impl SessionManager {
 					// gap and reports a poor connection.
 					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
+					tracing::info!(
+						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
+					);
+					return Ok(());
+				},
+				Some(SessionState::DesktopActive(active)) => {
+					active.reset_video_stream();
+					guard.session = Some(SessionState::DesktopActive(active));
 					tracing::info!(
 						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
 					);
@@ -399,7 +430,7 @@ impl SessionManager {
 		let mut guard = self.inner.lock().await;
 		let video_config = guard.video_config.clone();
 		let stream_timeout = guard.stream_timeout;
-		match launched
+		let (active, video_notify, audio_notify) = launched
 			.start(
 				video_config,
 				stream_timeout,
@@ -408,20 +439,14 @@ impl SessionManager {
 				stop,
 				guard.inhibit_sleep,
 			)
-			.await
-		{
-			Ok((active, video_notify, audio_notify)) => {
-				guard.session = Some(SessionState::Active(active));
-				guard.video_start_notify = Some(video_notify);
-				guard.audio_start_notify = Some(audio_notify);
-				Ok(())
-			},
-			Err(()) => {
-				guard.reset_session();
-				tracing::error!("Failed to start session streams.");
-				Err(())
-			},
-		}
+			.await?;
+		guard.session = Some(match active {
+			desktop_session::ActiveState::Regular(a) => SessionState::Active(a),
+			desktop_session::ActiveState::Desktop(a) => SessionState::DesktopActive(a),
+		});
+		guard.video_start_notify = Some(video_notify);
+		guard.audio_start_notify = Some(audio_notify);
+		Ok(())
 	}
 
 	/// Stop the session and return to Uninitialized state.

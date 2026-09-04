@@ -47,6 +47,10 @@ pub struct ApplicationConfig {
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Whether this is a desktop (screen capture) session.
+	#[serde(default)]
+	pub desktop: bool,
 }
 
 impl Default for ApplicationConfig {
@@ -60,6 +64,7 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			desktop: false,
 		}
 	}
 }
