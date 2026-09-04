@@ -27,14 +27,6 @@ const FRAME_CHANNEL_CAPACITY: usize = 2;
 const FORMAT_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(3);
 const DESKTOP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build a `SPA_PARAM_Buffers` pod declaring the acceptable buffer data
-/// types (a bitmask of `spa_data_type`, e.g. `1 << SPA_DATA_DmaBuf`).
-///
-/// Responding to the negotiated Format param with a Buffers param via
-/// `pw_stream_update_params` is required by the PipeWire negotiation
-/// protocol: without it the node picks a default buffer type, which on
-/// some screencast pipelines is a plain memfd (`SPA_DATA_MemFd`) that is
-/// not importable into Vulkan as a DMA-BUF.
 fn build_buffers_param(data_type_mask: i32) -> Vec<u8> {
 	use std::io::Cursor;
 	use pw::spa::pod::{Object, Property, Value};
@@ -229,8 +221,6 @@ impl Desktop {
 
 struct Shared {
 	frame_tx: SyncSender<ExportedFrame>,
-	/// Pending buffers: (pw_buffer pointer, consumed flag, optional (mmap ptr, size)).
-	/// The mmap is for MemFd buffers and must be unmapped when the buffer is recycled.
 	pending: Vec<(
 		*mut pw::sys::pw_buffer,
 		Arc<AtomicBool>,
@@ -348,11 +338,6 @@ fn run_capture_inner(
 				"Desktop capture format negotiated"
 			);
 
-			// Complete the PipeWire buffer negotiation: ack the buffer data
-			// type we can consume. Request DMA-BUF buffers when the format
-			// advertises a modifier, otherwise fall back to plain memory.
-			// Without this ack the node defaults to memfd buffers, which
-			// cannot be imported into Vulkan as DMA-BUF.
 			let buffer_types = if param
 				.as_object()
 				.ok()
@@ -385,7 +370,6 @@ fn run_capture_inner(
 			shared.pending.retain_mut(|entry| {
 				let (buf, consumed, mmap_info) = entry;
 				if consumed.load(Ordering::Acquire) {
-					// Unmap MemFd buffers before recycling.
 					if let Some((ptr, size)) = mmap_info.take() {
 						unsafe { libc::munmap(ptr, size); }
 					}
@@ -439,7 +423,12 @@ fn run_capture_inner(
 
 				match shared.frame_tx.try_send(frame) {
 					Ok(()) => shared.pending.push((buf, consumed, mmap_ptr.map(|p| (p, mmap_size)))),
-					Err(_) => unsafe { stream.queue_raw_buffer(buf) },
+					Err(_) => {
+						if let Some(ptr) = mmap_ptr {
+							unsafe { libc::munmap(ptr, mmap_size) };
+						}
+						unsafe { stream.queue_raw_buffer(buf) };
+					},
 				}
 			}
 		})
@@ -536,11 +525,10 @@ fn run_capture_inner(
 		mainloop.loop_().iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
 	}
 
-	for (buf, _, mmap_info) in shared.borrow_mut().pending.drain(..) {
+	for (_, _, mmap_info) in shared.borrow_mut().pending.drain(..) {
 		if let Some((ptr, size)) = mmap_info {
 			unsafe { libc::munmap(ptr, size); }
 		}
-		unsafe { stream.queue_raw_buffer(buf) };
 	}
 
 	Ok(())
@@ -588,7 +576,6 @@ unsafe fn buffer_plane(buf: *mut pw::sys::pw_buffer) -> Option<(RawFd, u32, u32,
 	let chunk = unsafe { &*data.chunk };
 
 	if is_memfd {
-		// MemFd buffer — mmap it so the pipeline can CPU-copy into a VkImage.
 		let size = chunk.size as usize;
 		if size == 0 {
 			return None;

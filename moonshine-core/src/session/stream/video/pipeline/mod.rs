@@ -3,6 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod cpu_upload;
 mod dmabuf;
 mod hdr_sei;
 
@@ -24,6 +25,7 @@ use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
+use cpu_upload::CpuUploader;
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
@@ -682,6 +684,7 @@ impl VideoPipelineInner {
 
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
+		let mut cpu_uploader: Option<CpuUploader> = None;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
@@ -900,94 +903,46 @@ impl VideoPipelineInner {
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-				// For software (memfd) buffers that have a mmap'd pointer,
-				// upload via CPU staging buffer + vkCmdCopyBufferToImage.
-				// The converter's barrier (ALL_COMMANDS src stage) will
-				// implicitly wait for the copy to finish.
-				//
-				// `cpu_upload_guard` keeps the staging buffer + image alive
-				// until the converter finishes reading from the image.
-				let mut cpu_upload_guard: Option<(
-					vk::Buffer,
-					vk::DeviceMemory,
-					vk::Image,
-					vk::DeviceMemory,
-				)> = None;
 				let source_image;
 				let src_layout;
 
 				if let Some(mapped_ptr) = frame.planes[0].mapped_ptr.map(|p| p.0) {
-					let device = context.device();
-					let queue_family = context.transfer_queue_family();
-					let qf = [queue_family];
-
-					// Linear image with host-visible memory — can memcpy directly
-					// from the mmap'd memfd without a staging buffer or transfer.
-					let image = {
-						let create_info = vk::ImageCreateInfo::default()
-							.image_type(vk::ImageType::TYPE_2D)
-							.format(import_vk_format)
-							.extent(vk::Extent3D {
-								width: frame.width,
-								height: frame.height,
-								depth: 1,
-							})
-							.mip_levels(1)
-							.array_layers(1)
-							.samples(vk::SampleCountFlags::TYPE_1)
-							.tiling(vk::ImageTiling::LINEAR)
-							.usage(vk::ImageUsageFlags::SAMPLED)
-							.sharing_mode(vk::SharingMode::EXCLUSIVE)
-							.queue_family_indices(&qf)
-							.initial_layout(vk::ImageLayout::UNDEFINED);
-						unsafe { device.create_image(&create_info, None) }
-							.map_err(|e| format!("CPU upload image: {e}"))?
+					let uploader = match &mut cpu_uploader {
+						Some(u) => u,
+						None => {
+							cpu_uploader = Some(CpuUploader::new(context.clone()));
+							cpu_uploader.as_mut().unwrap()
+						},
 					};
-
-					let image_mem_reqs = unsafe { device.get_image_memory_requirements(image) };
-					let image_mem_type = context
-						.find_memory_type(image_mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
-						.ok_or_else(|| "CPU upload: no HOST_VISIBLE memory type".to_string())?;
-
-					let image_memory = {
-						let alloc_info = vk::MemoryAllocateInfo::default()
-							.allocation_size(image_mem_reqs.size)
-							.memory_type_index(image_mem_type);
-						unsafe { device.allocate_memory(&alloc_info, None) }
-							.map_err(|e| format!("CPU upload image memory: {e}"))?
-					};
-					unsafe { device.bind_image_memory(image, image_memory, 0) };
-
-					// Map image memory and memcpy directly from mmap'd memfd.
-					let img_ptr = unsafe {
-						device.map_memory(image_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-							.map_err(|e| format!("CPU upload map image: {e}"))?
-					};
-					unsafe {
-						std::ptr::copy_nonoverlapping(
-							mapped_ptr,
-							img_ptr as *mut u8,
-							frame.planes[0].mapped_size,
-						);
-					}
-					unsafe { device.unmap_memory(image_memory) };
-
-					// No transfer needed — image is already populated.
-					// Store resources so they stay alive until this scope ends
-					// (after the converter finishes reading from the image).
-					cpu_upload_guard = Some((vk::Buffer::null(), vk::DeviceMemory::null(), image, image_memory));
-
-					source_image = image;
-					src_layout = vk::ImageLayout::UNDEFINED;  // force converter acquire transition
-
-					tracing::debug!(
-						"CPU upload: {}x{} BGRx, image={:?}",
+					let (img, needs_transition) = match uploader.upload_or_reuse(
+						mapped_ptr,
+						frame.planes[0].mapped_size,
 						frame.width,
 						frame.height,
-						image,
+						frame.planes[0].stride,
+						import_vk_format,
+					) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::warn!("CPU upload failed: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					};
+					source_image = img;
+					src_layout = if needs_transition {
+						vk::ImageLayout::UNDEFINED
+					} else {
+						vk::ImageLayout::GENERAL
+					};
+					tracing::trace!(
+						"CPU upload: {}x{} {:?}, image={:?}",
+						frame.width,
+						frame.height,
+						import_vk_format,
+						img,
 					);
 				} else {
-					// DMA-BUF path — unchanged from before.
 					let importer = match &mut dmabuf_importer {
 						Some(imp) => imp,
 						None => match DmaBufImporter::new(context.clone()) {
@@ -1212,12 +1167,21 @@ impl VideoPipelineInner {
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
-						if frame_ctx_tx
-							.blocking_send(ConsumerMessage::Frame(frame_context, future))
-							.is_err()
-						{
-							tracing::debug!("Packet consumer gone; stopping encoding loop.");
-							break;
+						match frame_ctx_tx.try_send(ConsumerMessage::Frame(frame_context, future)) {
+							Ok(()) => {},
+							Err(mpsc::error::TrySendError::Full(_)) => {
+								in_flight.fetch_sub(1, Ordering::Relaxed);
+								submitted_count -= 1;
+								tracing::debug!(
+									"Packet consumer backed up; dropping encoded frame and forcing IDR."
+								);
+								encoder.request_idr();
+							},
+							Err(mpsc::error::TrySendError::Closed(_)) => {
+								in_flight.fetch_sub(1, Ordering::Relaxed);
+								tracing::debug!("Packet consumer gone; stopping encoding loop.");
+								break;
+							},
 						}
 					},
 					Err(e) => {
