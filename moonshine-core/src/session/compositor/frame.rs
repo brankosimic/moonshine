@@ -127,10 +127,6 @@ pub(crate) struct ExportedFrame {
 	pub hdr_metadata: Option<HdrMetadata>,
 }
 
-/// A valid mmap pointer to a software buffer.
-///
-/// Wrapped so we can safely implement `Send` — the pointer is only valid
-/// while the owning `ExportedFrame` lives (bounded by the channel send).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MappedPtr(pub *const u8);
 unsafe impl Send for MappedPtr {}
