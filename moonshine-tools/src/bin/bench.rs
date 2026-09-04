@@ -567,6 +567,7 @@ async fn run_benchmark(
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
+		desktop: false,
 	};
 
 	tracing::info!("Initializing session...");

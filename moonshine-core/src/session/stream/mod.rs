@@ -9,6 +9,15 @@ pub mod audio;
 pub mod control;
 pub mod video;
 
+/// Desktop streaming mode (Auto/On/Off).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DesktopMode {
+	#[default]
+	Auto,
+	On,
+	Off,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamConfig {
@@ -26,6 +35,9 @@ pub struct StreamConfig {
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub timeout: u64,
+
+	/// Whether to expose a "Desktop" app entry (Auto/On/Off).
+	pub desktop: DesktopMode,
 }
 
 impl Default for StreamConfig {
@@ -36,6 +48,7 @@ impl Default for StreamConfig {
 			audio: Default::default(),
 			control: Default::default(),
 			timeout: 60,
+			desktop: Default::default(),
 		}
 	}
 }

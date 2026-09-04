@@ -812,6 +812,7 @@ impl Webserver {
 				audio_channels,
 				audio_channel_mask,
 				hdr,
+				desktop: application.desktop,
 			})
 			.await;
 

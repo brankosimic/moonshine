@@ -1253,6 +1253,8 @@ impl MoonshineCompositor {
 					fd: handle.as_raw_fd(),
 					offset,
 					stride,
+					mapped_ptr: None,
+					mapped_size: 0,
 				},
 			)
 			.collect();
@@ -1417,6 +1419,8 @@ impl MoonshineCompositor {
 					fd: handle.as_raw_fd(),
 					offset,
 					stride,
+					mapped_ptr: None,
+					mapped_size: 0,
 				},
 			)
 			.collect();
@@ -1433,7 +1437,6 @@ impl MoonshineCompositor {
 			color_space,
 			hdr_metadata,
 		};
-
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
 		match self.frame_tx.try_send(exported_frame) {
@@ -1774,6 +1777,8 @@ fn export_dmabuf(
 			fd: handle.as_raw_fd(),
 			offset,
 			stride,
+			mapped_ptr: None,
+			mapped_size: 0,
 		})
 		.collect();
 

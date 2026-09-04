@@ -900,24 +900,147 @@ impl VideoPipelineInner {
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-				let (source_image, needs_transition) =
-					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}");
-							frame.consumed.store(true, Ordering::Release);
-							continue;
+				// For software (memfd) buffers that have a mmap'd pointer,
+				// upload via CPU staging buffer + vkCmdCopyBufferToImage.
+				// The converter's barrier (ALL_COMMANDS src stage) will
+				// implicitly wait for the copy to finish.
+				//
+				// `cpu_upload_guard` keeps the staging buffer + image alive
+				// until the converter finishes reading from the image.
+				let mut cpu_upload_guard: Option<(
+					vk::Buffer,
+					vk::DeviceMemory,
+					vk::Image,
+					vk::DeviceMemory,
+				)> = None;
+				let source_image;
+				let src_layout;
+
+				if let Some(mapped_ptr) = frame.planes[0].mapped_ptr.map(|p| p.0) {
+					let device = context.device();
+					let queue_family = context.transfer_queue_family();
+					let qf = [queue_family];
+
+					// Linear image with host-visible memory — can memcpy directly
+					// from the mmap'd memfd without a staging buffer or transfer.
+					let image = {
+						let create_info = vk::ImageCreateInfo::default()
+							.image_type(vk::ImageType::TYPE_2D)
+							.format(import_vk_format)
+							.extent(vk::Extent3D {
+								width: frame.width,
+								height: frame.height,
+								depth: 1,
+							})
+							.mip_levels(1)
+							.array_layers(1)
+							.samples(vk::SampleCountFlags::TYPE_1)
+							.tiling(vk::ImageTiling::LINEAR)
+							.usage(vk::ImageUsageFlags::SAMPLED)
+							.sharing_mode(vk::SharingMode::EXCLUSIVE)
+							.queue_family_indices(&qf)
+							.initial_layout(vk::ImageLayout::UNDEFINED);
+						unsafe { device.create_image(&create_info, None) }
+							.map_err(|e| format!("CPU upload image: {e}"))?
+					};
+
+					let image_mem_reqs = unsafe { device.get_image_memory_requirements(image) };
+					let image_mem_type = context
+						.find_memory_type(image_mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+						.ok_or_else(|| "CPU upload: no HOST_VISIBLE memory type".to_string())?;
+
+					let image_memory = {
+						let alloc_info = vk::MemoryAllocateInfo::default()
+							.allocation_size(image_mem_reqs.size)
+							.memory_type_index(image_mem_type);
+						unsafe { device.allocate_memory(&alloc_info, None) }
+							.map_err(|e| format!("CPU upload image memory: {e}"))?
+					};
+					unsafe { device.bind_image_memory(image, image_memory, 0) };
+
+					// Map image memory and memcpy directly from mmap'd memfd.
+					let img_ptr = unsafe {
+						device.map_memory(image_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+							.map_err(|e| format!("CPU upload map image: {e}"))?
+					};
+					unsafe {
+						std::ptr::copy_nonoverlapping(
+							mapped_ptr,
+							img_ptr as *mut u8,
+							frame.planes[0].mapped_size,
+						);
+					}
+					unsafe { device.unmap_memory(image_memory) };
+
+					// No transfer needed — image is already populated.
+					// Store resources so they stay alive until this scope ends
+					// (after the converter finishes reading from the image).
+					cpu_upload_guard = Some((vk::Buffer::null(), vk::DeviceMemory::null(), image, image_memory));
+
+					source_image = image;
+					src_layout = vk::ImageLayout::UNDEFINED;  // force converter acquire transition
+
+					tracing::debug!(
+						"CPU upload: {}x{} BGRx, image={:?}",
+						frame.width,
+						frame.height,
+						image,
+					);
+				} else {
+					// DMA-BUF path — unchanged from before.
+					let importer = match &mut dmabuf_importer {
+						Some(imp) => imp,
+						None => match DmaBufImporter::new(context.clone()) {
+							Ok(imp) => {
+								dmabuf_importer = Some(imp);
+								dmabuf_importer.as_mut().unwrap()
+							},
+							Err(e) => {
+								tracing::warn!("Failed to create DMA-BUF importer: {e}");
+								frame.consumed.store(true, Ordering::Release);
+								continue;
+							},
 						},
 					};
 
-				// First-time imports are in UNDEFINED layout; the converter
-				// will handle the transition inside its command buffer.
-				// Cached imports were left in GENERAL by the previous convert.
-				let src_layout = if needs_transition {
-					vk::ImageLayout::UNDEFINED
-				} else {
-					vk::ImageLayout::GENERAL
+					// Build DmaBufPlane array from ExportedFrame planes.
+					let mut planes_buf = [DmaBufPlane {
+						fd: 0,
+						offset: 0,
+						stride: 0,
+						modifier: 0,
+					}; 4];
+					let plane_count = frame.planes.len().min(4);
+					for (i, p) in frame.planes.iter().take(4).enumerate() {
+						planes_buf[i] = DmaBufPlane {
+							fd: p.fd,
+							offset: p.offset,
+							stride: p.stride,
+							modifier: frame.modifier,
+						};
+					}
+					let planes = &planes_buf[..plane_count];
+
+					// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
+					let (source_img, needs_transition) =
+						match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
+							Ok(result) => result,
+							Err(e) => {
+								tracing::warn!("Failed to import DMA-BUF: {e}");
+								frame.consumed.store(true, Ordering::Release);
+								continue;
+							},
+						};
+
+					// First-time imports are in UNDEFINED layout; the converter
+					// will handle the transition inside its command buffer.
+					// Cached imports were left in GENERAL by the previous convert.
+					source_image = source_img;
+					src_layout = if needs_transition {
+						vk::ImageLayout::UNDEFINED
+					} else {
+						vk::ImageLayout::GENERAL
+					};
 				};
 
 				let t2_imported = std::time::Instant::now();
@@ -1015,6 +1138,7 @@ impl VideoPipelineInner {
 				}
 
 				// Convert to YUV.
+				tracing::debug!("GPU color conversion: source_image={:?}, src_layout={:?}", source_image, src_layout);
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
 					frame.consumed.store(true, Ordering::Release);
 					if is_device_lost(&e) {
@@ -1060,7 +1184,11 @@ impl VideoPipelineInner {
 				// Encode the converted image. This is asynchronous: it submits the
 				// frame without blocking; the encoded packet is produced by the
 				// readback thread and handled by the consumer thread.
+				tracing::debug!("Encoding frame");
 				let encode_result = encoder.encode(encoder.input_image());
+				if encode_result.is_err() {
+					tracing::warn!("Encoding failed");
+				}
 
 				let t4_encoded = std::time::Instant::now();
 
