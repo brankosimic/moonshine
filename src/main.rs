@@ -1,4 +1,5 @@
 use moonshine_core::app_scanner;
+use moonshine_core::desktop_streaming;
 use moonshine_core::healthcheck;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -56,6 +57,12 @@ async fn main() -> Result<(), ()> {
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let mut config = Config::load_or_create(&config_path)?;
+
+	// Inject the "Desktop" app entry when desktop streaming is enabled
+	// (via `[stream] desktop = "On"` in the config, or "Auto" on a KDE
+	// Plasma Wayland session). Without this the app is never exposed in
+	// the applist that clients see.
+	desktop_streaming::inject_desktop_app(&mut config);
 
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {

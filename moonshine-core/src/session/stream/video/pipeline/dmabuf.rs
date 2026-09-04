@@ -343,7 +343,15 @@ impl DmaBufImporter {
 		let memory_type_index = self
 			.context
 			.find_memory_type(memory_type_bits, vk::MemoryPropertyFlags::empty())
-			.ok_or_else(|| "No suitable memory type for DMA-BUF import".to_string())?;
+			.ok_or_else(|| {
+				format!(
+					"No suitable memory type for DMA-BUF import (image_bits={:#x}, fd_bits={:#x}, combined={:#x}, size={})",
+					mem_requirements.memory_type_bits,
+					memory_fd_properties.memory_type_bits,
+					memory_type_bits,
+					mem_requirements.size,
+				)
+			})?;
 
 		// Dedicated allocation (required by many drivers for external memory).
 		let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
