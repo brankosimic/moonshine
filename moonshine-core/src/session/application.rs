@@ -68,7 +68,8 @@ impl ApplicationConfig {
 	pub fn id(&self) -> i32 {
 		let mut hasher = DefaultHasher::new();
 		self.title.hash(&mut hasher);
-		hasher.finish() as i32
+		// Clients only accept non-negative application IDs.
+		(hasher.finish() as i32) & i32::MAX
 	}
 }
 
