@@ -1,21 +1,20 @@
 use std::cell::RefCell;
-use std::os::unix::io::{OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::io::{BorrowedFd, OwnedFd, RawFd};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ashpd::desktop::remote_desktop::{
-	Axis, DeviceType, KeyState, RemoteDesktop,
-};
+use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use async_shutdown::ShutdownManager;
 use pipewire as pw;
 use pw::spa;
-use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::pod::PropertyFlags;
+use pw::spa::pod::serialize::PodSerializer;
 use pw::spa::utils::Id;
 
 use crate::session::SessionContext;
@@ -26,23 +25,33 @@ use crate::session::manager::SessionShutdownReason;
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 const FORMAT_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(3);
 const DESKTOP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPTURE_LOOP_TIMEOUT: Duration = Duration::from_millis(500);
 
-fn build_buffers_param(data_type_mask: i32) -> Vec<u8> {
-	use std::io::Cursor;
+fn build_buffers_param(data_type_mask: i32, prefer_linear: bool) -> Vec<u8> {
 	use pw::spa::pod::{Object, Property, Value};
+	use std::io::Cursor;
+
+	let mut properties = vec![Property {
+		key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
+		flags: PropertyFlags::empty(),
+		value: Value::Int(data_type_mask),
+	}];
+	if prefer_linear {
+		properties.push(Property {
+			key: pw::spa::sys::SPA_FORMAT_VIDEO_modifier,
+			flags: PropertyFlags::empty(),
+			value: Value::Long(0),
+		});
+	}
 
 	let buffers = Object {
 		type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamBuffers,
 		id: pw::spa::sys::SPA_PARAM_Buffers,
-		properties: vec![Property {
-			key: pw::spa::sys::SPA_PARAM_BUFFERS_dataType,
-			flags: PropertyFlags::empty(),
-			value: Value::Int(data_type_mask),
-		}],
+		properties,
 	};
 	let mut data = Vec::new();
-	let (_cursor, _len) = PodSerializer::serialize(Cursor::new(&mut data), &Value::Object(buffers))
-		.expect("serialize buffers object");
+	let (_cursor, _len) =
+		PodSerializer::serialize(Cursor::new(&mut data), &Value::Object(buffers)).expect("serialize buffers object");
 	data
 }
 
@@ -176,12 +185,22 @@ impl Desktop {
 			.await
 			.map_err(|e| tracing::error!("Failed to open PipeWire remote: {e}"))?;
 
+		let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+		if wake_fd < 0 {
+			return Err(());
+		}
+		let wake_owned: OwnedFd = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(wake_fd) };
+
 		let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 		{
 			let stop = stop.clone();
+			let wake = wake_owned.try_clone().map_err(|e| {
+				tracing::error!("Failed to clone capture wakeup fd: {e}");
+			})?;
 			tokio::spawn(async move {
 				stop.wait_shutdown_triggered().await;
 				let _ = stop_tx.send(());
+				write_eventfd(wake.as_raw_fd());
 			});
 		}
 
@@ -205,6 +224,7 @@ impl Desktop {
 					stop_rx,
 					capture_stop,
 					ready_tx,
+					wake_owned,
 				);
 			})
 			.map_err(|e| tracing::error!("Failed to spawn desktop capture thread: {e}"))?;
@@ -240,6 +260,7 @@ fn run_capture(
 	stop_rx: std::sync::mpsc::Receiver<()>,
 	stop: ShutdownManager<SessionShutdownReason>,
 	ready_tx: SyncSender<Result<DesktopReady, String>>,
+	wake_fd: OwnedFd,
 ) {
 	let result = run_capture_inner(
 		fd,
@@ -249,16 +270,21 @@ fn run_capture(
 		frame_tx,
 		stop_rx,
 		ready_tx.clone(),
+		wake_fd,
 	);
 	if let Err(e) = result {
 		tracing::error!("Desktop capture stopped: {e}");
 		let _ = ready_tx.send(Err(e.clone()));
-		if stop.trigger_shutdown(SessionShutdownReason::DesktopStreamStopped).is_ok() {
+		if stop
+			.trigger_shutdown(SessionShutdownReason::DesktopStreamStopped)
+			.is_ok()
+		{
 			tracing::warn!("Triggered session shutdown after desktop capture failure.");
 		}
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_capture_inner(
 	fd: OwnedFd,
 	stream_id: u32,
@@ -267,12 +293,12 @@ fn run_capture_inner(
 	frame_tx: SyncSender<ExportedFrame>,
 	stop_rx: std::sync::mpsc::Receiver<()>,
 	ready_tx: SyncSender<Result<DesktopReady, String>>,
+	wake_fd: OwnedFd,
 ) -> Result<(), String> {
 	pw::init();
 
 	let mainloop = pw::main_loop::MainLoopBox::new(None).map_err(|e| format!("main loop: {e}"))?;
-	let context =
-		pw::context::ContextBox::new(mainloop.loop_(), None).map_err(|e| format!("context: {e}"))?;
+	let context = pw::context::ContextBox::new(mainloop.loop_(), None).map_err(|e| format!("context: {e}"))?;
 	let core = context
 		.connect_fd(fd, None)
 		.map_err(|e| format!("connect to PipeWire remote: {e}"))?;
@@ -287,6 +313,8 @@ fn run_capture_inner(
 		},
 	)
 	.map_err(|e| format!("stream: {e}"))?;
+
+	let wake_raw = wake_fd.as_raw_fd();
 
 	let shared = Rc::new(RefCell::new(Shared {
 		frame_tx: frame_tx.clone(),
@@ -344,13 +372,14 @@ fn run_capture_inner(
 				.and_then(|obj| obj.find_prop(Id(pw::spa::sys::SPA_FORMAT_VIDEO_modifier)))
 				.is_some()
 			{
-				tracing::info!("Requesting DMA-BUF capture buffers");
+				tracing::info!("Requesting DMA-BUF capture buffers (preferring linear layout)");
 				1 << pw::spa::sys::SPA_DATA_DmaBuf
 			} else {
 				tracing::info!("Requesting memory capture buffers");
 				1 << pw::spa::sys::SPA_DATA_MemPtr
 			};
-			let pod_bytes = build_buffers_param(buffer_types);
+			let prefer_linear = buffer_types & (1 << pw::spa::sys::SPA_DATA_DmaBuf) != 0;
+			let pod_bytes = build_buffers_param(buffer_types, prefer_linear);
 			let Some(buffers_pod) = pw::spa::pod::Pod::from_bytes(&pod_bytes) else {
 				tracing::warn!("Failed to parse serialized buffers param");
 				return;
@@ -364,14 +393,16 @@ fn run_capture_inner(
 
 			shared.borrow_mut().info = Some(info);
 		})
-		.process(|stream, shared| {
+		.process(move |stream, shared| {
 			let mut shared = shared.borrow_mut();
 
 			shared.pending.retain_mut(|entry| {
 				let (buf, consumed, mmap_info) = entry;
 				if consumed.load(Ordering::Acquire) {
 					if let Some((ptr, size)) = mmap_info.take() {
-						unsafe { libc::munmap(ptr, size); }
+						unsafe {
+							libc::munmap(ptr, size);
+						}
 					}
 					unsafe { stream.queue_raw_buffer(*buf) };
 					false
@@ -380,9 +411,11 @@ fn run_capture_inner(
 				}
 			});
 
-			let Some(info) = shared.info.as_ref() else { return; };
-			let Some((fourcc, width, height, modifier)) = captured_format(info)
-				.map(|(fourcc, width, height)| (fourcc, width, height, info.modifier()))
+			let Some(info) = shared.info.as_ref() else {
+				return;
+			};
+			let Some((fourcc, width, height, modifier)) =
+				captured_format(info).map(|(fourcc, width, height)| (fourcc, width, height, info.modifier()))
 			else {
 				return;
 			};
@@ -393,9 +426,7 @@ fn run_capture_inner(
 					break;
 				}
 
-				let Some((fd, offset, stride, mmap_ptr, mmap_size)) =
-					(unsafe { buffer_plane(buf) })
-				else {
+				let Some((fd, offset, stride, mmap_ptr, mmap_size)) = (unsafe { buffer_plane(buf) }) else {
 					unsafe { stream.queue_raw_buffer(buf) };
 					continue;
 				};
@@ -422,7 +453,10 @@ fn run_capture_inner(
 				shared.next_index = shared.next_index.wrapping_add(1);
 
 				match shared.frame_tx.try_send(frame) {
-					Ok(()) => shared.pending.push((buf, consumed, mmap_ptr.map(|p| (p, mmap_size)))),
+					Ok(()) => {
+						shared.pending.push((buf, consumed, mmap_ptr.map(|p| (p, mmap_size))));
+						write_eventfd(wake_raw);
+					},
 					Err(_) => {
 						if let Some(ptr) = mmap_ptr {
 							unsafe { libc::munmap(ptr, mmap_size) };
@@ -468,7 +502,10 @@ fn run_capture_inner(
 			Rectangle,
 			pw::spa::utils::Rectangle { width: w, height: h },
 			pw::spa::utils::Rectangle { width: 1, height: 1 },
-			pw::spa::utils::Rectangle { width: 16384, height: 16384 }
+			pw::spa::utils::Rectangle {
+				width: 16384,
+				height: 16384
+			}
 		),
 		pw::spa::pod::property!(
 			pw::spa::param::format::FormatProperties::VideoFramerate,
@@ -498,9 +535,15 @@ fn run_capture_inner(
 			&mut params,
 		)
 		.map_err(|e| format!("connect stream: {e}"))?;
-	stream
-		.set_active(true)
-		.map_err(|e| format!("activate stream: {e}"))?;
+	stream.set_active(true).map_err(|e| format!("activate stream: {e}"))?;
+
+	let _wake_source = mainloop.loop_().add_io(
+		wake_fd.as_fd(),
+		spa::support::system::IoFlags::IN,
+		move |io: &mut BorrowedFd<'_>| {
+			drain_eventfd(io.as_raw_fd());
+		},
+	);
 
 	let deadline = Instant::now() + FORMAT_NEGOTIATION_TIMEOUT;
 	loop {
@@ -513,25 +556,53 @@ fn run_capture_inner(
 		if Instant::now() > deadline {
 			return Err("timed out waiting for capture format negotiation".to_string());
 		}
-		mainloop.loop_().iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
+		mainloop
+			.loop_()
+			.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
 	}
 
-	let _ = ready_tx.send(Ok(DesktopReady { resolution, stream_id, hdr: false }));
+	let _ = ready_tx.send(Ok(DesktopReady {
+		resolution,
+		stream_id,
+		hdr: false,
+	}));
 
 	loop {
 		if stop_rx.try_recv().is_ok() {
 			break;
 		}
-		mainloop.loop_().iterate(pw::loop_::Timeout::Finite(Duration::from_millis(100)));
+		mainloop
+			.loop_()
+			.iterate(pw::loop_::Timeout::Finite(CAPTURE_LOOP_TIMEOUT));
 	}
 
 	for (_, _, mmap_info) in shared.borrow_mut().pending.drain(..) {
 		if let Some((ptr, size)) = mmap_info {
-			unsafe { libc::munmap(ptr, size); }
+			unsafe {
+				libc::munmap(ptr, size);
+			}
 		}
 	}
 
 	Ok(())
+}
+
+fn write_eventfd(fd: RawFd) {
+	let val: u64 = 1;
+	unsafe {
+		let _ = libc::write(
+			fd,
+			&val as *const u64 as *const libc::c_void,
+			std::mem::size_of::<u64>(),
+		);
+	}
+}
+
+fn drain_eventfd(fd: RawFd) {
+	let mut buf = [0u8; 8];
+	unsafe {
+		let _ = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+	}
 }
 
 fn captured_format(info: &spa::param::video::VideoInfoRaw) -> Option<(u32, u32, u32)> {
@@ -555,9 +626,7 @@ fn captured_format(info: &spa::param::video::VideoInfoRaw) -> Option<(u32, u32, 
 
 unsafe fn buffer_plane(buf: *mut pw::sys::pw_buffer) -> Option<(RawFd, u32, u32, Option<*mut libc::c_void>, usize)> {
 	let spa_buf = unsafe { (*buf).buffer };
-	if spa_buf.is_null()
-		|| unsafe { (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() }
-	{
+	if spa_buf.is_null() || unsafe { (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() } {
 		return None;
 	}
 	let data = unsafe { &*((*spa_buf).datas) };
@@ -648,12 +717,16 @@ async fn forward_input(
 	stream_id: u32,
 ) {
 	let result = match event {
-		CompositorInputEvent::KeyDown { keycode } => remote_desktop
-			.notify_keyboard_keycode(session, *keycode as i32, KeyState::Pressed)
-			.await,
-		CompositorInputEvent::KeyUp { keycode } => remote_desktop
-			.notify_keyboard_keycode(session, *keycode as i32, KeyState::Released)
-			.await,
+		CompositorInputEvent::KeyDown { keycode } => {
+			remote_desktop
+				.notify_keyboard_keycode(session, *keycode as i32, KeyState::Pressed)
+				.await
+		},
+		CompositorInputEvent::KeyUp { keycode } => {
+			remote_desktop
+				.notify_keyboard_keycode(session, *keycode as i32, KeyState::Released)
+				.await
+		},
 		CompositorInputEvent::MouseMoveAbsolute {
 			x,
 			y,
@@ -675,21 +748,50 @@ async fn forward_input(
 				.notify_pointer_motion_absolute(session, stream_id, nx, ny)
 				.await
 		},
-		CompositorInputEvent::MouseMoveRelative { dx, dy } => remote_desktop
-			.notify_pointer_motion(session, *dx as f64, *dy as f64)
-			.await,
-		CompositorInputEvent::MouseButtonDown { button } => remote_desktop
-			.notify_pointer_button(session, *button as i32, KeyState::Pressed)
-			.await,
-		CompositorInputEvent::MouseButtonUp { button } => remote_desktop
-			.notify_pointer_button(session, *button as i32, KeyState::Released)
-			.await,
-		CompositorInputEvent::ScrollVertical { amount } => remote_desktop
-			.notify_pointer_axis_discrete(session, Axis::Vertical, *amount as i32)
-			.await,
-		CompositorInputEvent::ScrollHorizontal { amount } => remote_desktop
-			.notify_pointer_axis_discrete(session, Axis::Horizontal, *amount as i32)
-			.await,
+		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
+			remote_desktop
+				.notify_pointer_motion(session, *dx as f64, *dy as f64)
+				.await
+		},
+		CompositorInputEvent::MouseButtonDown { button } => {
+			remote_desktop
+				.notify_pointer_button(session, *button as i32, KeyState::Pressed)
+				.await
+		},
+		CompositorInputEvent::MouseButtonUp { button } => {
+			remote_desktop
+				.notify_pointer_button(session, *button as i32, KeyState::Released)
+				.await
+		},
+		CompositorInputEvent::ScrollVertical { amount } => {
+			remote_desktop
+				.notify_pointer_axis_discrete(session, Axis::Vertical, *amount as i32)
+				.await
+		},
+		CompositorInputEvent::ScrollHorizontal { amount } => {
+			remote_desktop
+				.notify_pointer_axis_discrete(session, Axis::Horizontal, *amount as i32)
+				.await
+		},
+		CompositorInputEvent::TouchDown { slot, x, y } => {
+			let (nx, ny) = map_stream_to_capture(*x as f64, *y as f64, 1.0, 1.0, capture_size, stream_size);
+			remote_desktop
+				.notify_touch_down(session, stream_id, *slot, nx, ny)
+				.await
+		},
+		CompositorInputEvent::TouchMove { slot, x, y } => {
+			let (nx, ny) = map_stream_to_capture(*x as f64, *y as f64, 1.0, 1.0, capture_size, stream_size);
+			remote_desktop
+				.notify_touch_motion(session, stream_id, *slot, nx, ny)
+				.await
+		},
+		CompositorInputEvent::TouchUp { slot } => remote_desktop.notify_touch_up(session, *slot).await,
+		CompositorInputEvent::TouchCancelAll
+		| CompositorInputEvent::Pen { .. }
+		| CompositorInputEvent::TypeText { .. } => {
+			tracing::debug!(target: "input", "Ignoring unsupported portal input event: {event:?}");
+			Ok(())
+		},
 	};
 
 	if let Err(e) = result {
@@ -700,7 +802,7 @@ async fn forward_input(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::desktop_streaming::{detect_desktop_session, desktop_application};
+	use crate::desktop_streaming::{desktop_application, detect_desktop_session};
 
 	#[test]
 	fn detects_kde_wayland_session() {
@@ -741,9 +843,7 @@ mod tests {
 			assert_eq!(got_fourcc, fourcc);
 		}
 
-		assert!(
-			captured_format(&info_for(spa::param::video::VideoFormat::A420)).is_none(),
-		);
+		assert!(captured_format(&info_for(spa::param::video::VideoFormat::A420)).is_none(),);
 	}
 
 	#[test]

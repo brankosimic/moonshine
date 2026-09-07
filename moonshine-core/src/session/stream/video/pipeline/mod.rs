@@ -5,6 +5,7 @@
 
 mod cpu_upload;
 mod dmabuf;
+mod gpu_scaler;
 mod hdr_sei;
 
 use std::sync::Arc;
@@ -26,7 +27,8 @@ use crate::session::stream::video::{
 };
 
 use cpu_upload::CpuUploader;
-use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
+use dmabuf::{DmaBufImporter, DmaBufPlane};
+use gpu_scaler::{GpuImageScaler, GpuScaler};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
@@ -47,6 +49,8 @@ use pixelforge::{
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
 /// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
+const DESKTOP_MAX_FRAMES_IN_FLIGHT: usize = 4;
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
@@ -640,8 +644,14 @@ impl VideoPipelineInner {
 		// `MAX_FRAMES_IN_FLIGHT`); the consumer decrements it per frame. The channel
 		// is sized just above that gate so it never actually blocks the producer —
 		// admission is governed by the drop gate, not by the channel filling.
+		let max_in_flight = if ctx.desktop_mode {
+			DESKTOP_MAX_FRAMES_IN_FLIGHT
+		} else {
+			MAX_FRAMES_IN_FLIGHT
+		};
+
 		let in_flight = Arc::new(AtomicUsize::new(0));
-		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(max_in_flight + 2);
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
@@ -675,9 +685,8 @@ impl VideoPipelineInner {
 			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
 		};
 
-		// Converter per input format, plus the source import whose view it caches.
-		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
-			std::collections::HashMap::new();
+		// Color converter will be initialized on first frame.
+		let mut color_converter: Option<ColorConverter> = None;
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -686,6 +695,8 @@ impl VideoPipelineInner {
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 		let mut cpu_uploader: Option<CpuUploader> = None;
+		let mut scaler: Option<GpuScaler> = None;
+		let mut image_scaler: Option<GpuImageScaler> = None;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
@@ -845,7 +856,7 @@ impl VideoPipelineInner {
 				// keeps the encoded P-frame chain valid (a skipped frame never enters
 				// the encoder's reference state). The IDR re-encode path is never
 				// gated — the client needs that keyframe.
-				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
+				if in_flight.load(Ordering::Relaxed) >= max_in_flight {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
 							"Video encode backpressure: packet consumer is behind; dropping captured \
@@ -869,14 +880,10 @@ impl VideoPipelineInner {
 				);
 
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
-				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
+				let (mut frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-				// Pins the DMA-BUF import so the image outlives the converter's
-				// cached view of it. `None` on the CPU-upload path, where
-				// `CpuUploader` owns the image for its whole lifetime.
-				let source_cached: Option<Arc<CachedImport>>;
-				let source_image;
-				let src_layout;
+				let mut source_image;
+				let mut src_layout;
 
 				if let Some(mapped_ptr) = frame.planes[0].mapped_ptr.map(|p| p.0) {
 					let uploader = match &mut cpu_uploader {
@@ -907,7 +914,6 @@ impl VideoPipelineInner {
 					} else {
 						vk::ImageLayout::GENERAL
 					};
-					source_cached = None;
 					tracing::trace!(
 						"CPU upload: {}x{} {:?}, image={:?}",
 						frame.width,
@@ -949,35 +955,149 @@ impl VideoPipelineInner {
 					}
 					let planes = &planes_buf[..plane_count];
 
-					// The `Arc` pins the image while the converter caches a view of it.
-					let (source_import, needs_transition) =
-						match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
-							Ok(result) => result,
-							Err(e) => {
-								tracing::warn!("Failed to import DMA-BUF: {e}");
-								frame.consumed.store(true, Ordering::Release);
-								continue;
-							},
-						};
+					// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
+					let (source_img, needs_transition) = match importer.import_or_reuse(
+						planes[0].fd,
+						frame.width,
+						frame.height,
+						import_vk_format,
+						planes,
+					) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::warn!("Failed to import DMA-BUF: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					};
 
 					// First-time imports are in UNDEFINED layout; the converter
 					// will handle the transition inside its command buffer.
 					// Cached imports were left in GENERAL by the previous convert.
-					source_image = source_import.image();
+					source_image = source_img.image();
 					src_layout = if needs_transition {
 						vk::ImageLayout::UNDEFINED
 					} else {
 						vk::ImageLayout::GENERAL
 					};
-					source_cached = Some(source_import);
 				};
 				let t2_imported = std::time::Instant::now();
 
-				// Get (or build) a converter for this input format. Cached per
-				// format so switching render paths doesn't rebuild one each frame.
-				let (converter, cached_source) = match color_converters.entry(frame.format) {
-					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-					std::collections::hash_map::Entry::Vacant(e) => {
+				if frame.width != ctx.width || frame.height != ctx.height {
+					let needs_scale_8bit = matches!(frame.format, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258);
+					let mapped_ptr = frame.planes[0].mapped_ptr.map(|p| p.0);
+					if !needs_scale_8bit {
+						tracing::warn!(
+							format = frame.format,
+							"Cannot scale non-8-bit desktop capture to target resolution; encoding at native size."
+						);
+					} else if let Some(mapped_ptr) = mapped_ptr {
+						let s = match &mut scaler {
+							Some(s) => s,
+							None => match GpuScaler::new(context.clone()) {
+								Ok(s) => {
+									scaler = Some(s);
+									scaler.as_mut().unwrap()
+								},
+								Err(e) => {
+									tracing::warn!("Failed to create GPU scaler: {e}; encoding at native size.");
+									frame.consumed.store(true, Ordering::Release);
+									continue;
+								},
+							},
+						};
+						match s.scale(
+							mapped_ptr,
+							frame.width,
+							frame.height,
+							frame.planes[0].stride,
+							ctx.width,
+							ctx.height,
+						) {
+							Ok(scaled_image) => {
+								source_image = scaled_image;
+								src_layout = vk::ImageLayout::GENERAL;
+								frame_input_format = InputFormat::RGBA;
+								tracing::trace!(
+									"Scaled desktop frame {}x{} -> {}x{} (letterboxed)",
+									frame.width,
+									frame.height,
+									ctx.width,
+									ctx.height,
+								);
+							},
+							Err(e) => {
+								let device_lost = e.to_lowercase().contains("device has been lost");
+								if device_lost {
+									return Err(format!("GPU scale failed: {e}"));
+								}
+								tracing::warn!("GPU scale failed: {e}; encoding at native size.");
+							},
+						}
+					} else {
+						let img_scaler = match &mut image_scaler {
+							Some(s) => s,
+							None => match GpuImageScaler::new(context.clone()) {
+								Ok(s) => {
+									image_scaler = Some(s);
+									image_scaler.as_mut().unwrap()
+								},
+								Err(e) => {
+									tracing::warn!("Failed to create GPU image scaler: {e}; encoding at native size.");
+									frame.consumed.store(true, Ordering::Release);
+									continue;
+								},
+							},
+						};
+						match img_scaler.scale(
+							source_image,
+							src_layout,
+							frame.width,
+							frame.height,
+							ctx.width,
+							ctx.height,
+						) {
+							Ok(scaled_image) => {
+								source_image = scaled_image;
+								src_layout = vk::ImageLayout::GENERAL;
+								frame_input_format = InputFormat::RGBA;
+								tracing::trace!(
+									"GPU-scaled desktop frame {}x{} -> {}x{}",
+									frame.width,
+									frame.height,
+									ctx.width,
+									ctx.height,
+								);
+							},
+							Err(e) => {
+								let device_lost = e.to_lowercase().contains("device has been lost");
+								if device_lost {
+									return Err(format!("GPU scale failed: {e}"));
+								}
+								tracing::warn!("GPU scale failed: {e}; encoding at native size.");
+							},
+						}
+					}
+				}
+
+				// Recreate the converter if the input format changed (e.g. GBM pool
+				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
+				// format must match the source image format.
+				if let Some(ref conv) = color_converter
+					&& conv.config().input_format != frame_input_format
+				{
+					tracing::info!(
+						"Input format changed from {:?} to {:?}, recreating color converter",
+						conv.config().input_format,
+						frame_input_format,
+					);
+					color_converter = None;
+				}
+
+				// Initialize converter if needed.
+				let converter = match &mut color_converter {
+					Some(conv) => conv,
+					None => {
 						let (color_space, full_range) = match ctx.dynamic_range {
 							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
@@ -988,8 +1108,8 @@ impl VideoPipelineInner {
 						config.full_range = full_range;
 						match ColorConverter::new(context.clone(), config) {
 							Ok(conv) => {
-								tracing::debug!("Created color converter for input format {frame_input_format:?}");
-								e.insert((conv, None))
+								color_converter = Some(conv);
+								color_converter.as_mut().unwrap()
 							},
 							Err(e) => {
 								tracing::warn!("Failed to create color converter: {e}");
@@ -1052,13 +1172,12 @@ impl VideoPipelineInner {
 					}
 				}
 
-				// Retain the source image; the converter caches a view of it.
-				// `None` on the CPU-upload path, where `cpu_upload_guard` owns
-				// the image instead.
-				*cached_source = source_cached;
-
 				// Convert to YUV.
-				tracing::debug!("GPU color conversion: source_image={:?}, src_layout={:?}", source_image, src_layout);
+				tracing::debug!(
+					"GPU color conversion: source_image={:?}, src_layout={:?}",
+					source_image,
+					src_layout
+				);
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
 					frame.consumed.store(true, Ordering::Release);
 					if is_device_lost(&e) {
@@ -1137,9 +1256,7 @@ impl VideoPipelineInner {
 							Err(mpsc::error::TrySendError::Full(_)) => {
 								in_flight.fetch_sub(1, Ordering::Relaxed);
 								submitted_count -= 1;
-								tracing::debug!(
-									"Packet consumer backed up; dropping encoded frame and forcing IDR."
-								);
+								tracing::debug!("Packet consumer backed up; dropping encoded frame and forcing IDR.");
 								encoder.request_idr();
 							},
 							Err(mpsc::error::TrySendError::Closed(_)) => {
