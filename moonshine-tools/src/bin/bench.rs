@@ -600,6 +600,7 @@ async fn run_benchmark(
 		max_reference_frames: 1,
 		full_range: false,
 		encrypt_video: false,
+		desktop_mode: false,
 	};
 
 	let audio_ctx = AudioStreamContext {

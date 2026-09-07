@@ -404,6 +404,7 @@ impl RtspServer {
 			max_reference_frames,
 			full_range,
 			encrypt_video: self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
+			desktop_mode: false,
 		};
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
