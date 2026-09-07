@@ -32,9 +32,10 @@ impl CpuUploader {
 	) -> Result<(vk::Image, bool), String> {
 		let device = self.context.device();
 
-		let needs_create = self.cached.as_ref().is_none_or(|c| {
-			c.width != width || c.height != height || c.format != format
-		});
+		let needs_create = self
+			.cached
+			.as_ref()
+			.is_none_or(|c| c.width != width || c.height != height || c.format != format);
 		if needs_create {
 			if let Some(old) = self.cached.take() {
 				tracing::debug!(
@@ -53,7 +54,11 @@ impl CpuUploader {
 			let create_info = vk::ImageCreateInfo::default()
 				.image_type(vk::ImageType::TYPE_2D)
 				.format(format)
-				.extent(vk::Extent3D { width, height, depth: 1 })
+				.extent(vk::Extent3D {
+					width,
+					height,
+					depth: 1,
+				})
 				.mip_levels(1)
 				.array_layers(1)
 				.samples(vk::SampleCountFlags::TYPE_1)
@@ -61,8 +66,8 @@ impl CpuUploader {
 				.usage(vk::ImageUsageFlags::SAMPLED)
 				.sharing_mode(vk::SharingMode::EXCLUSIVE)
 				.initial_layout(vk::ImageLayout::UNDEFINED);
-			let image = unsafe { device.create_image(&create_info, None) }
-				.map_err(|e| format!("CPU upload image: {e}"))?;
+			let image =
+				unsafe { device.create_image(&create_info, None) }.map_err(|e| format!("CPU upload image: {e}"))?;
 
 			let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
 			let mem_type = self
@@ -116,29 +121,30 @@ impl CpuUploader {
 		}
 
 		let cached = self.cached.as_mut().expect("CPU upload image just created");
-		let dst_ptr = unsafe {
-			device.map_memory(cached.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-		}
-		.map_err(|e| format!("CPU upload map image: {e}"))?;
+		let dst_ptr = unsafe { device.map_memory(cached.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
+			.map_err(|e| format!("CPU upload map image: {e}"))?;
 
-		let row_len = (stride as u64).min(cached.row_pitch) as usize;
-		let mut src_off = 0usize;
-		let mut dst_off = 0u64;
-		for _ in 0..height {
-			let remaining = src_size.saturating_sub(src_off);
-			if remaining == 0 {
-				break;
+		let dst = dst_ptr as *mut u8;
+		if stride as u64 == cached.row_pitch {
+			let total = (stride as u64)
+				.saturating_mul(height as u64)
+				.min(src_size as u64)
+				.min(cached.row_pitch.saturating_mul(height as u64)) as usize;
+			unsafe { std::ptr::copy_nonoverlapping(src, dst, total) };
+		} else {
+			let row_len = (stride as u64).min(cached.row_pitch) as usize;
+			let mut src_off = 0usize;
+			let mut dst_off = 0u64;
+			for _ in 0..height {
+				let remaining = src_size.saturating_sub(src_off);
+				if remaining == 0 {
+					break;
+				}
+				let len = row_len.min(remaining);
+				unsafe { std::ptr::copy_nonoverlapping(src.add(src_off), dst.add(dst_off as usize), len) };
+				src_off += stride as usize;
+				dst_off += cached.row_pitch;
 			}
-			let len = row_len.min(remaining);
-			unsafe {
-				std::ptr::copy_nonoverlapping(
-					src.add(src_off),
-					(dst_ptr as *mut u8).add(dst_off as usize),
-					len,
-				);
-			}
-			src_off += stride as usize;
-			dst_off += cached.row_pitch;
 		}
 		unsafe { device.unmap_memory(cached.memory) };
 

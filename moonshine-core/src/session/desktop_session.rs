@@ -10,7 +10,7 @@ use super::desktop::{Desktop, LaunchedDesktop};
 use super::inhibit::SleepInhibitor;
 use super::stream::audio::{AudioStream, AudioStreamConfig, AudioStreamContext};
 use super::stream::control::{ControlStream, ControlStreamConfig, ControlStreamContext};
-use super::stream::video::{VideoStream, VideoStreamConfig, VideoStreamContext, VideoStreamHandle, FrameStats};
+use super::stream::video::{FrameStats, VideoStream, VideoStreamConfig, VideoStreamContext, VideoStreamHandle};
 
 /// Wrapper for launched session states (regular or desktop).
 pub(crate) enum LaunchedState {
@@ -92,13 +92,9 @@ impl DesktopInitializedSession {
 
 		let (desktop, handles) = Desktop::new(&context, stop.clone());
 
-		let audio = AudioStream::new(
-			AudioStreamConfig::default(),
-			address.clone(),
-			stop.clone(),
-		)
-		.await
-		.map_err(|()| tracing::error!("Failed to create audio stream for desktop session"))?;
+		let audio = AudioStream::new(AudioStreamConfig::default(), address.clone(), stop.clone())
+			.await
+			.map_err(|()| tracing::error!("Failed to create audio stream for desktop session"))?;
 
 		let video_stream = VideoStream::new(
 			VideoStreamConfig::default(),
@@ -111,13 +107,9 @@ impl DesktopInitializedSession {
 		.await
 		.map_err(|()| tracing::error!("Failed to create video stream for desktop session"))?;
 
-		let control_stream = ControlStream::new(
-			ControlStreamConfig::default(),
-			address,
-			handles.input_tx,
-			stop.clone(),
-		)
-		.map_err(|()| tracing::error!("Failed to create control stream for desktop session"))?;
+		let control_stream =
+			ControlStream::new(ControlStreamConfig::default(), address, handles.input_tx, stop.clone())
+				.map_err(|()| tracing::error!("Failed to create control stream for desktop session"))?;
 
 		Ok(Self {
 			context,
@@ -174,7 +166,7 @@ impl DesktopLaunchedSession {
 		self,
 		_video_config: VideoStreamConfig,
 		_stream_timeout: u64,
-		mut video_ctx: VideoStreamContext,
+		video_ctx: VideoStreamContext,
 		audio_ctx: AudioStreamContext,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
@@ -189,21 +181,25 @@ impl DesktopLaunchedSession {
 			stop,
 		} = self;
 
-		let (width, height) = launched_desktop.ready.resolution;
-		video_ctx.width = width;
-		video_ctx.height = height;
+		let (negotiated_w, negotiated_h) = (video_ctx.width, video_ctx.height);
+		let (captured_w, captured_h) = launched_desktop.ready.resolution;
+		tracing::info!(
+			negotiated_w,
+			negotiated_h,
+			captured_w,
+			captured_h,
+			"Desktop stream using negotiated resolution; capture will be scaled if needed."
+		);
+
+		let mut video_ctx = video_ctx;
+		video_ctx.desktop_mode = true;
 
 		let keys_rx = context.keys.clone_rx().ok_or_else(|| {
 			tracing::error!("Session keys not initialized");
 		})?;
 
 		let video_handle = video_stream
-			.start(
-				VideoStreamConfig::default(),
-				video_ctx,
-				keys_rx.clone(),
-				stop.clone(),
-			)
+			.start(VideoStreamConfig::default(), video_ctx, keys_rx.clone(), stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		let audio_trigger = audio

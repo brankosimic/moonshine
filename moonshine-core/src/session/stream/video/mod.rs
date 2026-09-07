@@ -176,6 +176,8 @@ pub struct VideoStreamContext {
 
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,
+
+	pub desktop_mode: bool,
 }
 
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
