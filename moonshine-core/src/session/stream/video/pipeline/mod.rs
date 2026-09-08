@@ -1062,13 +1062,15 @@ impl VideoPipelineInner {
 										},
 									};
 									match gpu_copy.upload_or_reuse(ptr, frame.width, frame.height, plane.stride, import_vk_format) {
-										Ok((img, needs_transition)) => {
+										Ok((img, _needs_transition)) => {
 											source_image = img;
-											src_layout = if needs_transition {
-												vk::ImageLayout::UNDEFINED
-											} else {
-												vk::ImageLayout::GENERAL
-											};
+											// The GPU-copy image is a regular device-local image (not a
+											// DMA-BUF external-memory import), so it must NEVER be
+											// reported as UNDEFINED: both the converter and the image
+											// scaler treat UNDEFINED as "external acquire" and would run
+											// an illegal QUEUE_FAMILY_EXTERNAL barrier on it. GENERAL is
+											// always correct here — the importer leaves it in GENERAL.
+											src_layout = vk::ImageLayout::GENERAL;
 										},
 										Err(e) => {
 											tracing::warn!("DMA-BUF GPU copy failed: {e}");
