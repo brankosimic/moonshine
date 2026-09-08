@@ -2,8 +2,12 @@
 members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
 resolver = "2"
 
-# TEMP (debug): patch pixelforge to a local copy so we can instrument the
-# color converter's YUV output. Remove this block + .pixelforge-patch/ when done.
+# Patch pixelforge to a local fork that fixes the color converter on RADV/AMD:
+# upstream v0.9.1 populates COMBINED_IMAGE_SAMPLER descriptors via
+# VK_EXT_descriptor_buffer (vkGetDescriptorEXT), which on this driver makes
+# texelFetch return only the R channel (G/B/A read as zero) -> green-screen
+# stream. The fork switches the converter to a plain descriptor set, which
+# samples correctly. Keep this until the fix is upstreamed and a new tag cut.
 [patch."https://github.com/hgaiser/pixelforge"]
 pixelforge = { path = ".pixelforge-patch" }
 
