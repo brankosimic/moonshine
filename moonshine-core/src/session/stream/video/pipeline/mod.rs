@@ -692,6 +692,16 @@ impl VideoPipelineInner {
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
 
+		// The encoder runs with an infinite GOP (see `with_gop_size(0)`), so it
+		// never emits a periodic keyframe on its own — keyframes only happen when
+		// we explicitly request one. That is fragile: if the client never sends a
+		// reference-frame-invalidation (some Moonlight builds don't, or the report
+		// is lost), a decoder that falls out of sync has no way to resync and stays
+		// black. A periodic IDR guarantees a fresh keyframe every few seconds, giving
+		// the stream a resync point independent of client behaviour.
+		let idr_period = std::time::Duration::from_secs(2);
+		let mut last_idr_time = std::time::Instant::now();
+
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 		let mut cpu_uploader: Option<CpuUploader> = None;
@@ -733,6 +743,17 @@ impl VideoPipelineInner {
 		while !stop_session_manager.is_shutdown_triggered() {
 			let mut pending_idr = false;
 
+			// Periodic keyframe: the infinite-GOP encoder only emits an IDR when we
+			// ask, so schedule one every `idr_period` to guarantee the client always
+			// has a resync point. Gated on `has_encoded` so we don't request an IDR
+			// before the first real frame is in flight.
+			if has_encoded && last_idr_time.elapsed() >= idr_period {
+				tracing::debug!("Periodic IDR requested (infinite-GOP safety net)");
+				encoder.request_idr();
+				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
+			}
+
 			// Drain any pending stream-reset requests (client reconnect/resume).
 			//
 			// Moonlight starts every (re)connected session with its frame counter at 1
@@ -760,6 +781,7 @@ impl VideoPipelineInner {
 				frame_number_base = submitted_count;
 				encoder.request_idr();
 				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
 			}
 
 			// Drain any pending IDR requests.
@@ -769,34 +791,44 @@ impl VideoPipelineInner {
 						tracing::debug!("IDR frame requested");
 						encoder.request_idr();
 						pending_idr = true;
+						last_idr_time = std::time::Instant::now();
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						tracing::debug!("IDR frame channel lagged by {n} messages.");
 						encoder.request_idr();
 						pending_idr = true;
+						last_idr_time = std::time::Instant::now();
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
 			}
 
-			// Drain any pending reference-frame-invalidation requests. Each takes
-			// effect on the next submitted frame, which then predicts from a
-			// surviving reference instead of forcing an IDR (the encoder still
-			// falls back to an IDR when no reference survives).
+			// Drain any pending reference-frame-invalidation requests. The client
+			// reports it lost a run of frames and can no longer decode — so it needs
+			// a fresh keyframe to resync, full stop. We drop the tainted references
+			// from the encoder's DPB *and* force an IDR on the next frame. Relying on
+			// pixelforge's "predict from a surviving reference" heuristic (which only
+			// falls back to an IDR when *no* reference survives) leaves a fully
+			// desynced client black: it still gets P-frames referencing pictures it
+			// never had, and keeps re-requesting invalidation forever.
 			loop {
 				match invalidate_request_rx.try_recv() {
 					Ok((first, _last)) => {
 						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
 						tracing::debug!(
-							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
+							"Reference frame invalidation requested from client frame {first} (display order {first_display_order}); forcing IDR"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						encoder.request_idr();
+						pending_idr = true;
+						last_idr_time = std::time::Instant::now();
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
 						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
 						encoder.request_idr();
 						pending_idr = true;
+						last_idr_time = std::time::Instant::now();
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
@@ -984,9 +1016,10 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				if frame.width != ctx.width || frame.height != ctx.height {
-					let needs_scale_8bit = matches!(frame.format, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258);
-					let mapped_ptr = frame.planes[0].mapped_ptr.map(|p| p.0);
+			if frame.width != ctx.width || frame.height != ctx.height {
+				let needs_scale_8bit = matches!(frame.format, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258);
+				let swap_rb = matches!(frame.format, 0x34325241 | 0x34325258);
+				let mapped_ptr = frame.planes[0].mapped_ptr.map(|p| p.0);
 					if !needs_scale_8bit {
 						tracing::warn!(
 							format = frame.format,
@@ -1007,36 +1040,44 @@ impl VideoPipelineInner {
 								},
 							},
 						};
-						match s.scale(
-							mapped_ptr,
-							frame.width,
-							frame.height,
-							frame.planes[0].stride,
-							ctx.width,
-							ctx.height,
-						) {
-							Ok(scaled_image) => {
-								source_image = scaled_image;
-								src_layout = vk::ImageLayout::GENERAL;
-								frame_input_format = InputFormat::RGBA;
-								tracing::trace!(
-									"Scaled desktop frame {}x{} -> {}x{} (letterboxed)",
-									frame.width,
-									frame.height,
-									ctx.width,
-									ctx.height,
-								);
-							},
-							Err(e) => {
-								let device_lost = e.to_lowercase().contains("device has been lost");
-								if device_lost {
-									return Err(format!("GPU scale failed: {e}"));
-								}
-								tracing::warn!("GPU scale failed: {e}; encoding at native size.");
-							},
-						}
-					} else {
-						let img_scaler = match &mut image_scaler {
+					let t_scale = std::time::Instant::now();
+					match s.scale(
+						mapped_ptr,
+						frame.width,
+						frame.height,
+						frame.planes[0].stride,
+						ctx.width,
+						ctx.height,
+						swap_rb,
+					) {
+						Ok(scaled_image) => {
+							tracing::debug!(scale_us = t_scale.elapsed().as_micros() as u64, "scale done");
+							source_image = scaled_image;
+							// The scaler leaves its dst in a clean GENERAL layout. Report
+							// GENERAL (NOT UNDEFINED): UNDEFINED makes the converter apply a
+							// QUEUE_FAMILY_EXTERNAL acquire, which is only valid for DMA-BUF
+							// external-memory imports. This image is a regular device-local
+							// image, so an external acquire yields a black readback.
+							src_layout = vk::ImageLayout::GENERAL;
+							frame_input_format = InputFormat::RGBA;
+							tracing::trace!(
+								"Scaled desktop frame {}x{} -> {}x{} (letterboxed)",
+								frame.width,
+								frame.height,
+								ctx.width,
+								ctx.height,
+							);
+						},
+						Err(e) => {
+							let device_lost = e.to_lowercase().contains("device has been lost");
+							if device_lost {
+								return Err(format!("GPU scale failed: {e}"));
+							}
+							tracing::warn!("GPU scale failed: {e}; encoding at native size.");
+						},
+					}
+				} else {
+					let img_scaler = match &mut image_scaler {
 							Some(s) => s,
 							None => match GpuImageScaler::new(context.clone()) {
 								Ok(s) => {
@@ -1052,6 +1093,7 @@ impl VideoPipelineInner {
 						};
 						match img_scaler.scale(
 							source_image,
+							import_vk_format,
 							src_layout,
 							frame.width,
 							frame.height,

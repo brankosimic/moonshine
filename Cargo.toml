@@ -2,6 +2,11 @@
 members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
 resolver = "2"
 
+# TEMP (debug): patch pixelforge to a local copy so we can instrument the
+# color converter's YUV output. Remove this block + .pixelforge-patch/ when done.
+[patch."https://github.com/hgaiser/pixelforge"]
+pixelforge = { path = ".pixelforge-patch" }
+
 [workspace.package]
 version = "0.15.0"
 
