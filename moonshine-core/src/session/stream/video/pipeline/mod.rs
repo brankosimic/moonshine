@@ -29,7 +29,7 @@ use crate::session::stream::video::{
 
 use cpu_upload::CpuUploader;
 use dmabuf::{DmaBufImporter, DmaBufPlane};
-use gpu_copy::{GpuCopyImporter, map_dmabuf_plane};
+use gpu_copy::map_dmabuf_plane;
 use gpu_scaler::{GpuImageScaler, GpuScaler};
 
 use pixelforge::{
@@ -707,7 +707,6 @@ impl VideoPipelineInner {
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 		let mut cpu_uploader: Option<CpuUploader> = None;
-		let mut gpu_copy_importer: Option<GpuCopyImporter> = None;
 		let mut scaler: Option<GpuScaler> = None;
 		let mut image_scaler: Option<GpuImageScaler> = None;
 
@@ -1043,44 +1042,22 @@ impl VideoPipelineInner {
 							};
 						},
 						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}; falling back to GPU copy.");
+							tracing::warn!("Failed to import DMA-BUF: {e}; falling back to CPU upload.");
 							let fb = map_dmabuf_plane(planes[0].fd, planes[0].offset, plane.stride, frame.height);
 							match fb {
-								Some((ptr, _size)) => {
-									let gpu_copy = match &mut gpu_copy_importer {
-										Some(g) => g,
-										None => match GpuCopyImporter::new(context.clone()) {
-											Ok(g) => {
-												gpu_copy_importer = Some(g);
-												gpu_copy_importer.as_mut().unwrap()
-											},
-											Err(e) => {
-												tracing::warn!("Failed to create GPU copy importer: {e}");
-												frame.consumed.store(true, Ordering::Release);
-												continue;
-											},
-										},
-									};
-									match gpu_copy.upload_or_reuse(ptr, frame.width, frame.height, plane.stride, import_vk_format) {
-										Ok((img, _needs_transition)) => {
-											source_image = img;
-											// The GPU-copy image is a regular device-local image (not a
-											// DMA-BUF external-memory import), so it must NEVER be
-											// reported as UNDEFINED: both the converter and the image
-											// scaler treat UNDEFINED as "external acquire" and would run
-											// an illegal QUEUE_FAMILY_EXTERNAL barrier on it. GENERAL is
-											// always correct here — the importer leaves it in GENERAL.
-											src_layout = vk::ImageLayout::GENERAL;
-										},
-										Err(e) => {
-											tracing::warn!("DMA-BUF GPU copy failed: {e}");
-											frame.consumed.store(true, Ordering::Release);
-											continue;
-										},
-									}
+								Some((ptr, size)) => match upload_frame(ptr, size) {
+									Ok((img, layout)) => {
+										source_image = img;
+										src_layout = layout;
+									},
+									Err(e) => {
+										tracing::warn!("DMA-BUF CPU upload failed: {e}");
+										frame.consumed.store(true, Ordering::Release);
+										continue;
+									},
 								},
 								None => {
-									tracing::warn!("DMA-BUF GPU-copy mmap unavailable; dropping frame.");
+									tracing::warn!("DMA-BUF plane mmap unavailable; dropping frame.");
 									frame.consumed.store(true, Ordering::Release);
 									continue;
 								},
