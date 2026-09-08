@@ -5,10 +5,10 @@
 
 mod cpu_upload;
 mod dmabuf;
+mod gpu_copy;
 mod gpu_scaler;
 mod hdr_sei;
 
-use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -29,6 +29,7 @@ use crate::session::stream::video::{
 
 use cpu_upload::CpuUploader;
 use dmabuf::{DmaBufImporter, DmaBufPlane};
+use gpu_copy::{GpuCopyImporter, map_dmabuf_plane};
 use gpu_scaler::{GpuImageScaler, GpuScaler};
 
 use pixelforge::{
@@ -96,35 +97,6 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 		// lost. See <...>".
 		_ => e.to_string().contains("device has been lost"),
 	}
-}
-
-/// Fallback for DMA-BUF frames the driver cannot import as external memory
-/// (e.g. RADV reports no usable memory type for certain large-res portal
-/// buffers). Maps the plane's fd read-only and returns a pointer + size so the
-/// caller can feed it through the CPU-upload path instead of dropping the frame.
-fn map_dmabuf_plane(fd: RawFd, offset: u32, stride: u32, height: u32) -> Option<(*const u8, usize)> {
-	if fd < 0 {
-		return None;
-	}
-	let size = (stride as usize) * (height as usize);
-	if size == 0 {
-		return None;
-	}
-	let ptr = unsafe {
-		libc::mmap(
-			std::ptr::null_mut(),
-			size,
-			libc::PROT_READ,
-			libc::MAP_PRIVATE,
-			fd,
-			offset as libc::off_t,
-		)
-	};
-	if ptr == libc::MAP_FAILED {
-		tracing::warn!("DMA-BUF CPU fallback: mmap failed fd={fd} size={size}");
-		return None;
-	}
-	Some((ptr as *const u8, size))
 }
 
 pub(crate) struct VideoPipeline {}
@@ -735,6 +707,7 @@ impl VideoPipelineInner {
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 		let mut cpu_uploader: Option<CpuUploader> = None;
+		let mut gpu_copy_importer: Option<GpuCopyImporter> = None;
 		let mut scaler: Option<GpuScaler> = None;
 		let mut image_scaler: Option<GpuImageScaler> = None;
 
@@ -1070,23 +1043,42 @@ impl VideoPipelineInner {
 							};
 						},
 						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}; falling back to CPU upload.");
+							tracing::warn!("Failed to import DMA-BUF: {e}; falling back to GPU copy.");
 							let fb = map_dmabuf_plane(planes[0].fd, planes[0].offset, plane.stride, frame.height);
 							match fb {
-								Some((ptr, size)) => match upload_frame(ptr, size) {
-									Ok((img, layout)) => {
-										source_image = img;
-										src_layout = layout;
-										unsafe { libc::munmap(ptr as *mut libc::c_void, size) };
-									},
-									Err(e) => {
-										tracing::warn!("DMA-BUF CPU fallback upload failed: {e}");
-										frame.consumed.store(true, Ordering::Release);
-										continue;
-									},
+								Some((ptr, _size)) => {
+									let gpu_copy = match &mut gpu_copy_importer {
+										Some(g) => g,
+										None => match GpuCopyImporter::new(context.clone()) {
+											Ok(g) => {
+												gpu_copy_importer = Some(g);
+												gpu_copy_importer.as_mut().unwrap()
+											},
+											Err(e) => {
+												tracing::warn!("Failed to create GPU copy importer: {e}");
+												frame.consumed.store(true, Ordering::Release);
+												continue;
+											},
+										},
+									};
+									match gpu_copy.upload_or_reuse(ptr, frame.width, frame.height, plane.stride, import_vk_format) {
+										Ok((img, needs_transition)) => {
+											source_image = img;
+											src_layout = if needs_transition {
+												vk::ImageLayout::UNDEFINED
+											} else {
+												vk::ImageLayout::GENERAL
+											};
+										},
+										Err(e) => {
+											tracing::warn!("DMA-BUF GPU copy failed: {e}");
+											frame.consumed.store(true, Ordering::Release);
+											continue;
+										},
+									}
 								},
 								None => {
-									tracing::warn!("DMA-BUF CPU fallback mmap unavailable; dropping frame.");
+									tracing::warn!("DMA-BUF GPU-copy mmap unavailable; dropping frame.");
 									frame.consumed.store(true, Ordering::Release);
 									continue;
 								},
