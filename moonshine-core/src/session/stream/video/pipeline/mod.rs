@@ -8,6 +8,7 @@ mod dmabuf;
 mod gpu_scaler;
 mod hdr_sei;
 
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -95,6 +96,35 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 		// lost. See <...>".
 		_ => e.to_string().contains("device has been lost"),
 	}
+}
+
+/// Fallback for DMA-BUF frames the driver cannot import as external memory
+/// (e.g. RADV reports no usable memory type for certain large-res portal
+/// buffers). Maps the plane's fd read-only and returns a pointer + size so the
+/// caller can feed it through the CPU-upload path instead of dropping the frame.
+fn map_dmabuf_plane(fd: RawFd, offset: u32, stride: u32, height: u32) -> Option<(*const u8, usize)> {
+	if fd < 0 {
+		return None;
+	}
+	let size = (stride as usize) * (height as usize);
+	if size == 0 {
+		return None;
+	}
+	let ptr = unsafe {
+		libc::mmap(
+			std::ptr::null_mut(),
+			size,
+			libc::PROT_READ,
+			libc::MAP_PRIVATE,
+			fd,
+			offset as libc::off_t,
+		)
+	};
+	if ptr == libc::MAP_FAILED {
+		tracing::warn!("DMA-BUF CPU fallback: mmap failed fd={fd} size={size}");
+		return None;
+	}
+	Some((ptr as *const u8, size))
 }
 
 pub(crate) struct VideoPipeline {}
@@ -914,10 +944,28 @@ impl VideoPipelineInner {
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
 				let (mut frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-				let mut source_image;
-				let mut src_layout;
+				let plane = match frame.planes.first() {
+					Some(p) => p,
+					None => {
+						tracing::warn!("Received frame with no planes; dropping");
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					},
+				};
+				let mapped_ptr = plane.mapped_ptr.map(|p| p.0);
 
-				if let Some(mapped_ptr) = frame.planes[0].mapped_ptr.map(|p| p.0) {
+				// When a CPU-visible frame needs rescaling, the GPU scaler reads
+				// straight from the mapped source pointer — uploading it through
+				// `CpuUploader` first would be a wasted full-frame CPU copy, so
+				// skip the upload/import and go directly to the scale path.
+				let size_mismatch = frame.width != ctx.width || frame.height != ctx.height;
+				let needs_scale_8bit = matches!(frame.format, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258);
+				let cpu_scale = size_mismatch && needs_scale_8bit && mapped_ptr.is_some();
+
+				let mut source_image = vk::Image::null();
+				let mut src_layout = vk::ImageLayout::UNDEFINED;
+
+				let mut upload_frame = |src_ptr: *const u8, src_size: usize| -> Result<(vk::Image, vk::ImageLayout), String> {
 					let uploader = match &mut cpu_uploader {
 						Some(u) => u,
 						None => {
@@ -925,34 +973,44 @@ impl VideoPipelineInner {
 							cpu_uploader.as_mut().unwrap()
 						},
 					};
-					let (img, needs_transition) = match uploader.upload_or_reuse(
-						mapped_ptr,
-						frame.planes[0].mapped_size,
+					let (img, needs_transition) = uploader.upload_or_reuse(
+						src_ptr,
+						src_size,
 						frame.width,
 						frame.height,
-						frame.planes[0].stride,
+						plane.stride,
 						import_vk_format,
-					) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("CPU upload failed: {e}");
-							frame.consumed.store(true, Ordering::Release);
-							continue;
-						},
-					};
-					source_image = img;
-					src_layout = if needs_transition {
-						vk::ImageLayout::UNDEFINED
-					} else {
-						vk::ImageLayout::GENERAL
-					};
-					tracing::trace!(
-						"CPU upload: {}x{} {:?}, image={:?}",
-						frame.width,
-						frame.height,
-						import_vk_format,
+					)?;
+					Ok((
 						img,
-					);
+						if needs_transition {
+							vk::ImageLayout::UNDEFINED
+						} else {
+							vk::ImageLayout::GENERAL
+						},
+					))
+				};
+				if !cpu_scale {
+					if let Some(src_ptr) = mapped_ptr {
+						match upload_frame(src_ptr, plane.mapped_size) {
+							Ok((img, layout)) => {
+								source_image = img;
+								src_layout = layout;
+								tracing::trace!(
+									"CPU upload: {}x{} {:?}, image={:?}",
+									frame.width,
+									frame.height,
+									import_vk_format,
+									img,
+								);
+							},
+							Err(e) => {
+								tracing::warn!("CPU upload failed: {e}");
+								frame.consumed.store(true, Ordering::Release);
+								continue;
+							},
+						}
+					}
 				} else {
 					let importer = match &mut dmabuf_importer {
 						Some(imp) => imp,
@@ -988,38 +1046,59 @@ impl VideoPipelineInner {
 					let planes = &planes_buf[..plane_count];
 
 					// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-					let (source_img, needs_transition) = match importer.import_or_reuse(
+					// On failure, fall back to mapping the plane and CPU-uploading it
+					// rather than dropping the frame (some drivers report no usable
+					// memory type for certain large-res portal buffers).
+					let imported = importer.import_or_reuse(
 						planes[0].fd,
 						frame.width,
 						frame.height,
 						import_vk_format,
 						planes,
-					) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}");
-							frame.consumed.store(true, Ordering::Release);
-							continue;
-						},
-					};
+					);
 
-					// First-time imports are in UNDEFINED layout; the converter
-					// will handle the transition inside its command buffer.
-					// Cached imports were left in GENERAL by the previous convert.
-					source_image = source_img;
-					src_layout = if needs_transition {
-						vk::ImageLayout::UNDEFINED
-					} else {
-						vk::ImageLayout::GENERAL
+					match imported {
+						Ok((source_img, needs_transition)) => {
+							// First-time imports are in UNDEFINED layout; the converter
+							// will handle the transition inside its command buffer.
+							// Cached imports were left in GENERAL by the previous convert.
+							source_image = source_img;
+							src_layout = if needs_transition {
+								vk::ImageLayout::UNDEFINED
+							} else {
+								vk::ImageLayout::GENERAL
+							};
+						},
+						Err(e) => {
+							tracing::warn!("Failed to import DMA-BUF: {e}; falling back to CPU upload.");
+							let fb = map_dmabuf_plane(planes[0].fd, planes[0].offset, plane.stride, frame.height);
+							match fb {
+								Some((ptr, size)) => match upload_frame(ptr, size) {
+									Ok((img, layout)) => {
+										source_image = img;
+										src_layout = layout;
+										unsafe { libc::munmap(ptr as *mut libc::c_void, size) };
+									},
+									Err(e) => {
+										tracing::warn!("DMA-BUF CPU fallback upload failed: {e}");
+										frame.consumed.store(true, Ordering::Release);
+										continue;
+									},
+								},
+								None => {
+									tracing::warn!("DMA-BUF CPU fallback mmap unavailable; dropping frame.");
+									frame.consumed.store(true, Ordering::Release);
+									continue;
+								},
+							}
+						},
 					};
 				};
 
 				let t2_imported = std::time::Instant::now();
 
-			if frame.width != ctx.width || frame.height != ctx.height {
-				let needs_scale_8bit = matches!(frame.format, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258);
+			if size_mismatch {
 				let swap_rb = matches!(frame.format, 0x34325241 | 0x34325258);
-				let mapped_ptr = frame.planes[0].mapped_ptr.map(|p| p.0);
 					if !needs_scale_8bit {
 						tracing::warn!(
 							format = frame.format,
@@ -1045,7 +1124,7 @@ impl VideoPipelineInner {
 						mapped_ptr,
 						frame.width,
 						frame.height,
-						frame.planes[0].stride,
+						plane.stride,
 						ctx.width,
 						ctx.height,
 						swap_rb,
@@ -1074,6 +1153,22 @@ impl VideoPipelineInner {
 								return Err(format!("GPU scale failed: {e}"));
 							}
 							tracing::warn!("GPU scale failed: {e}; encoding at native size.");
+							// The up-front upload was skipped on the CPU-scale path, so
+							// there is no source image yet: upload now to encode at
+							// native size instead of feeding a null image to the converter.
+							if cpu_scale {
+								match upload_frame(mapped_ptr, plane.mapped_size) {
+									Ok((img, layout)) => {
+										source_image = img;
+										src_layout = layout;
+									},
+									Err(e) => {
+										tracing::warn!("CPU upload fallback failed: {e}");
+										frame.consumed.store(true, Ordering::Release);
+										continue;
+									},
+								}
+							}
 						},
 					}
 				} else {

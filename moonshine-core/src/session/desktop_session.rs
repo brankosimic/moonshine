@@ -51,22 +51,6 @@ pub(crate) enum ActiveState {
 	Desktop(DesktopActiveSession),
 }
 
-impl ActiveState {
-	fn context(&self) -> &SessionContext {
-		match self {
-			Self::Regular(s) => s.context(),
-			Self::Desktop(s) => s.context(),
-		}
-	}
-
-	fn reset_video_stream(&self) {
-		match self {
-			Self::Regular(s) => s.reset_video_stream(),
-			Self::Desktop(s) => s.reset_video_stream(),
-		}
-	}
-}
-
 pub(crate) struct DesktopInitializedSession {
 	context: SessionContext,
 	desktop: Desktop,
@@ -164,11 +148,11 @@ impl DesktopLaunchedSession {
 
 	pub(crate) async fn start(
 		self,
-		_video_config: VideoStreamConfig,
-		_stream_timeout: u64,
+		video_config: VideoStreamConfig,
+		stream_timeout: u64,
 		video_ctx: VideoStreamContext,
 		audio_ctx: AudioStreamContext,
-		_stop: ShutdownManager<SessionShutdownReason>,
+		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
 	) -> Result<(DesktopActiveSession, Arc<Notify>, Arc<Notify>), ()> {
 		let Self {
@@ -178,7 +162,7 @@ impl DesktopLaunchedSession {
 			audio,
 			control_stream,
 			hdr_metadata_rx,
-			stop,
+			stop: _session_stop,
 		} = self;
 
 		let (negotiated_w, negotiated_h) = (video_ctx.width, video_ctx.height);
@@ -199,7 +183,7 @@ impl DesktopLaunchedSession {
 		})?;
 
 		let video_handle = video_stream
-			.start(VideoStreamConfig::default(), video_ctx, keys_rx.clone(), stop.clone())
+			.start(video_config, video_ctx, keys_rx.clone(), stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		let audio_trigger = audio
@@ -212,7 +196,7 @@ impl DesktopLaunchedSession {
 		let video_handle_for_resume = video_handle.clone();
 
 		let control_ctx = ControlStreamContext::new(&context, false);
-		control_stream.start(60, control_ctx, video_handle, audio_trigger, hdr_metadata_rx);
+		control_stream.start(stream_timeout, control_ctx, video_handle, audio_trigger, hdr_metadata_rx);
 
 		let sleep_inhibitor = if inhibit_sleep {
 			SleepInhibitor::acquire().await
