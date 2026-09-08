@@ -574,6 +574,21 @@ fn run_capture_inner(
 		mainloop
 			.loop_()
 			.iterate(pw::loop_::Timeout::Finite(CAPTURE_LOOP_TIMEOUT));
+
+		shared.borrow_mut().pending.retain_mut(|entry| {
+			let (buf, consumed, mmap_info) = entry;
+			if consumed.load(Ordering::Acquire) {
+				if let Some((ptr, size)) = mmap_info.take() {
+					unsafe {
+						libc::munmap(ptr, size);
+					}
+				}
+				unsafe { stream.queue_raw_buffer(*buf) };
+				false
+			} else {
+				true
+			}
+		});
 	}
 
 	for (_, _, mmap_info) in shared.borrow_mut().pending.drain(..) {
