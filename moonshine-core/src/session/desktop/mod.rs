@@ -64,7 +64,6 @@ pub(crate) struct DesktopReady {
 	pub resolution: (u32, u32),
 	#[allow(dead_code)]
 	pub stream_id: u32,
-	pub hdr: bool,
 }
 
 pub(crate) struct LaunchedDesktop {
@@ -239,13 +238,18 @@ impl Desktop {
 	}
 }
 
+/// A frame handed off to the encoder but not yet consumed. Holds the raw
+/// PipeWire buffer (returned on consume), the consumed flag shared with the
+/// encode thread, and any `munmap` bookkeeping for memfd mappings.
+struct PendingFrame {
+	buf: *mut pw::sys::pw_buffer,
+	consumed: Arc<AtomicBool>,
+	unmap: Option<(*mut libc::c_void, usize)>,
+}
+
 struct Shared {
 	frame_tx: SyncSender<ExportedFrame>,
-	pending: Vec<(
-		*mut pw::sys::pw_buffer,
-		Arc<AtomicBool>,
-		Option<(*mut libc::c_void, usize)>,
-	)>,
+	pending: Vec<PendingFrame>,
 	next_index: u64,
 	info: Option<spa::param::video::VideoInfoRaw>,
 }
@@ -396,15 +400,14 @@ fn run_capture_inner(
 		.process(move |stream, shared| {
 			let mut shared = shared.borrow_mut();
 
-			shared.pending.retain_mut(|entry| {
-				let (buf, consumed, mmap_info) = entry;
-				if consumed.load(Ordering::Acquire) {
-					if let Some((ptr, size)) = mmap_info.take() {
+			shared.pending.retain_mut(|frame| {
+				if frame.consumed.load(Ordering::Acquire) {
+					if let Some((ptr, size)) = frame.unmap.take() {
 						unsafe {
 							libc::munmap(ptr, size);
 						}
 					}
-					unsafe { stream.queue_raw_buffer(*buf) };
+					unsafe { stream.queue_raw_buffer(frame.buf) };
 					false
 				} else {
 					true
@@ -426,10 +429,18 @@ fn run_capture_inner(
 					break;
 				}
 
-				let Some((fd, offset, stride, mmap_ptr, mmap_size)) = (unsafe { buffer_plane(buf) }) else {
+				let Some(plane) = (unsafe { buffer_plane(buf) }) else {
 					unsafe { stream.queue_raw_buffer(buf) };
 					continue;
 				};
+				let CapturePlane {
+					fd,
+					offset,
+					stride,
+					mapped_ptr,
+					mapped_size,
+					unmap,
+				} = plane;
 
 				let consumed = Arc::new(AtomicBool::new(false));
 				let frame = ExportedFrame {
@@ -437,8 +448,8 @@ fn run_capture_inner(
 						fd,
 						offset,
 						stride,
-						mapped_ptr: mmap_ptr.map(|p| crate::session::compositor::frame::MappedPtr(p as *const u8)),
-						mapped_size: mmap_size,
+						mapped_ptr: mapped_ptr.map(|p| crate::session::compositor::frame::MappedPtr(p as *const u8)),
+						mapped_size,
 					}],
 					format: fourcc,
 					modifier,
@@ -454,12 +465,12 @@ fn run_capture_inner(
 
 				match shared.frame_tx.try_send(frame) {
 					Ok(()) => {
-						shared.pending.push((buf, consumed, mmap_ptr.map(|p| (p, mmap_size))));
+						shared.pending.push(PendingFrame { buf, consumed, unmap });
 						write_eventfd(wake_raw);
 					},
 					Err(_) => {
-						if let Some(ptr) = mmap_ptr {
-							unsafe { libc::munmap(ptr, mmap_size) };
+						if let Some((ptr, size)) = unmap {
+							unsafe { libc::munmap(ptr, size) };
 						}
 						unsafe { stream.queue_raw_buffer(buf) };
 					},
@@ -564,7 +575,6 @@ fn run_capture_inner(
 	let _ = ready_tx.send(Ok(DesktopReady {
 		resolution,
 		stream_id,
-		hdr: false,
 	}));
 
 	loop {
@@ -575,15 +585,14 @@ fn run_capture_inner(
 			.loop_()
 			.iterate(pw::loop_::Timeout::Finite(CAPTURE_LOOP_TIMEOUT));
 
-		shared.borrow_mut().pending.retain_mut(|entry| {
-			let (buf, consumed, mmap_info) = entry;
-			if consumed.load(Ordering::Acquire) {
-				if let Some((ptr, size)) = mmap_info.take() {
+		shared.borrow_mut().pending.retain_mut(|frame| {
+			if frame.consumed.load(Ordering::Acquire) {
+				if let Some((ptr, size)) = frame.unmap.take() {
 					unsafe {
 						libc::munmap(ptr, size);
 					}
 				}
-				unsafe { stream.queue_raw_buffer(*buf) };
+				unsafe { stream.queue_raw_buffer(frame.buf) };
 				false
 			} else {
 				true
@@ -591,8 +600,8 @@ fn run_capture_inner(
 		});
 	}
 
-	for (_, _, mmap_info) in shared.borrow_mut().pending.drain(..) {
-		if let Some((ptr, size)) = mmap_info {
+	for frame in shared.borrow_mut().pending.drain(..) {
+		if let Some((ptr, size)) = frame.unmap {
 			unsafe {
 				libc::munmap(ptr, size);
 			}
@@ -639,7 +648,19 @@ fn captured_format(info: &spa::param::video::VideoInfoRaw) -> Option<(u32, u32, 
 	Some((fourcc, width, height))
 }
 
-unsafe fn buffer_plane(buf: *mut pw::sys::pw_buffer) -> Option<(RawFd, u32, u32, Option<*mut libc::c_void>, usize)> {
+/// A single captured buffer plane, either DMA-BUF (zero-copy import) or
+/// CPU-visible memory (memfd-mapped or inline memptr).
+struct CapturePlane {
+	fd: RawFd,
+	offset: u32,
+	stride: u32,
+	mapped_ptr: Option<*mut libc::c_void>,
+	mapped_size: usize,
+	/// munmap bookkeeping; `None` for DMA-BUF and memptr (nothing to unmap).
+	unmap: Option<(*mut libc::c_void, usize)>,
+}
+
+unsafe fn buffer_plane(buf: *mut pw::sys::pw_buffer) -> Option<CapturePlane> {
 	let spa_buf = unsafe { (*buf).buffer };
 	if spa_buf.is_null() || unsafe { (*spa_buf).n_datas == 0 || (*spa_buf).datas.is_null() } {
 		return None;
@@ -652,12 +673,34 @@ unsafe fn buffer_plane(buf: *mut pw::sys::pw_buffer) -> Option<(RawFd, u32, u32,
 		"Desktop capture buffer data"
 	);
 	let fd = data.fd as RawFd;
+
+	let is_memfd = data.type_ == pw::spa::sys::SPA_DATA_MemFd;
+	let is_memptr = data.type_ == pw::spa::sys::SPA_DATA_MemPtr;
+	let chunk = unsafe { &*data.chunk };
+
+	if is_memptr {
+		if data.data.is_null() {
+			return None;
+		}
+		let offset = chunk.offset as usize;
+		let size = (chunk.size as usize).saturating_sub(offset);
+		if size == 0 {
+			return None;
+		}
+		let ptr = unsafe { (data.data as *const u8).add(offset) as *mut libc::c_void };
+		return Some(CapturePlane {
+			fd: -1,
+			offset: 0,
+			stride: chunk.stride as u32,
+			mapped_ptr: Some(ptr),
+			mapped_size: size,
+			unmap: None,
+		});
+	}
+
 	if fd < 0 {
 		return None;
 	}
-
-	let is_memfd = data.type_ == pw::spa::sys::SPA_DATA_MemFd;
-	let chunk = unsafe { &*data.chunk };
 
 	if is_memfd {
 		let size = chunk.size as usize;
@@ -678,9 +721,23 @@ unsafe fn buffer_plane(buf: *mut pw::sys::pw_buffer) -> Option<(RawFd, u32, u32,
 			tracing::warn!("Failed to mmap MemFd buffer fd={fd} size={size}");
 			return None;
 		}
-		Some((fd, chunk.offset, chunk.stride as u32, Some(ptr), size))
+		Some(CapturePlane {
+			fd,
+			offset: chunk.offset,
+			stride: chunk.stride as u32,
+			mapped_ptr: Some(ptr),
+			mapped_size: size,
+			unmap: Some((ptr, size)),
+		})
 	} else {
-		Some((fd, chunk.offset, chunk.stride as u32, None, 0))
+		Some(CapturePlane {
+			fd,
+			offset: chunk.offset,
+			stride: chunk.stride as u32,
+			mapped_ptr: None,
+			mapped_size: 0,
+			unmap: None,
+		})
 	}
 }
 

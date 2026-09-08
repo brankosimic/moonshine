@@ -172,18 +172,6 @@ void main() {
 
     uint pixel_count = params.width * params.height;
 
-    if (params.output_format == 9u) {
-        // DEBUG: write raw RGBA (R,G,B,A=255) so we can inspect exactly what the
-        // sampler reads. Bypasses all YUV math and subsampling.
-        uint r = uint(clamp(rgb.r * 255.0, 0.0, 255.0));
-        uint g = uint(clamp(rgb.g * 255.0, 0.0, 255.0));
-        uint b = uint(clamp(rgb.b * 255.0, 0.0, 255.0));
-        uint rgba_word = (b << 24u) | (g << 16u) | (r << 8u) | 255u;
-        // pixel_count bytes total -> pixel_count/4 words, one word per pixel.
-        output_data[pixel_idx / 4u] |= rgba_word << ((pixel_idx % 4u) * 8u);
-        return;
-    }
-
     if (params.output_format == 2u) {
         // YUV444 8-bit: 2-plane semi-planar (Y plane + UV interleaved).
         uint y_byte_idx = pixel_idx;
