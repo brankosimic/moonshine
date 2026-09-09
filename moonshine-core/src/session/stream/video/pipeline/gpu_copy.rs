@@ -2,9 +2,6 @@
 //!
 //! Some drivers (e.g. NVIDIA at certain large resolutions) report no usable memory
 //! type for a portal buffer's DMA-BUF fd, so zero-copy `vkImportMemoryFd` fails.
-//! The caller uploads the mapped plane through the host-visible `CpuUploader`. A
-//! GPU-side `vkCmdCopyBufferToImage` upload was tried here but faults inside
-//! `libnvidia-eglcore` on `vkQueueSubmit` for this device, so it is not used.
 
 use std::os::fd::RawFd;
 
