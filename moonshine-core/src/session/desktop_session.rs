@@ -176,7 +176,8 @@ impl DesktopLaunchedSession {
 		);
 
 		let mut video_ctx = video_ctx;
-		video_ctx.desktop_mode = true;
+		let mut audio_ctx = audio_ctx;
+		mark_desktop_contexts(&mut video_ctx, &mut audio_ctx);
 
 		let keys_rx = context.keys.clone_rx().ok_or_else(|| {
 			tracing::error!("Session keys not initialized");
@@ -236,5 +237,52 @@ impl DesktopActiveSession {
 
 	pub(crate) fn reset_video_stream(&self) {
 		self.video_handle.request_reset();
+	}
+}
+
+/// Mark the stream contexts as belonging to a desktop session: the video
+/// pipeline takes the desktop frame path, and the audio stream swaps its
+/// private PulseAudio server for system-audio monitor capture.
+pub(crate) fn mark_desktop_contexts(
+	video_ctx: &mut super::stream::video::VideoStreamContext,
+	audio_ctx: &mut super::stream::audio::AudioStreamContext,
+) {
+	video_ctx.desktop_mode = true;
+	audio_ctx.desktop = true;
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn desktop_contexts_enable_desktop_mode_and_system_audio() {
+		let mut video_ctx = VideoStreamContext::default();
+		let mut audio_ctx = AudioStreamContext::default();
+		assert!(
+			!video_ctx.desktop_mode,
+			"regular sessions must not take the desktop frame path"
+		);
+		assert!(
+			!audio_ctx.desktop,
+			"regular sessions must use the private PulseAudio server"
+		);
+
+		mark_desktop_contexts(&mut video_ctx, &mut audio_ctx);
+		assert!(
+			video_ctx.desktop_mode,
+			"desktop sessions must take the desktop frame path"
+		);
+		assert!(audio_ctx.desktop, "desktop sessions must capture system audio");
+	}
+
+	#[test]
+	fn default_contexts_are_regular_sessions() {
+		// Guards against someone flipping a default and silently turning
+		// every regular session into a desktop session.
+		let video_ctx = VideoStreamContext::default();
+		let audio_ctx = AudioStreamContext::default();
+		assert!(!video_ctx.desktop_mode);
+		assert!(!audio_ctx.desktop);
 	}
 }
