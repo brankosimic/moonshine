@@ -3668,7 +3668,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/hgaiser/smithay?branch=master-moonshine#fd6e04e18114bceca6279362661b822b49663fe1"
+source = "git+https://github.com/hgaiser/smithay?branch=moonshine-other-atom#d2b6aaf524941b5bf342b08d87d845053e8fe22a"
 dependencies = [
  "appendlist",
  "atomic_float",

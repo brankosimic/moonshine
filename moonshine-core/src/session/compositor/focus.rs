@@ -196,7 +196,7 @@ impl WindowMetadata {
 	/// Returns `true` if this is a Steam Big Picture window.
 	/// Gamescope: detects STEAM_LEGACY_BIG_PICTURE property.
 	pub fn is_steam_big_picture(&self) -> bool {
-		self.app_id == 769
+		self.app_id == crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID
 	}
 
 	/// Returns `true` if the window should fill the output. Steam counts even

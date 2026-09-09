@@ -233,6 +233,19 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
+	// Impersonate gamescope so Steam uses its external-overlay mode.
+	envs.push("XDG_CURRENT_DESKTOP=gamescope".to_string());
+	envs.push(format!("GAMESCOPE_WAYLAND_DISPLAY={}", context.wayland_display));
+	envs.push(format!("STEAM_GAME_DISPLAY_0=:{}", context.xdisplay));
+	// Steam keys gamescope features (HDR, VRR, scaling, FPS limit) off these.
+	envs.push("STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1".to_string());
+	envs.push("STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1".to_string());
+	envs.push("STEAM_GAMESCOPE_NIS_SUPPORTED=1".to_string());
+	envs.push("STEAM_GAMESCOPE_VRR_SUPPORTED=1".to_string());
+	if context.hdr {
+		envs.push("STEAM_GAMESCOPE_HDR_SUPPORTED=1".to_string());
+	}
+
 	if context.hdr {
 		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
