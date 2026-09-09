@@ -457,6 +457,7 @@ impl RtspServer {
 			qos: audio_qos_type != "0",
 			audio_config,
 			encrypt_audio: client_encryption_flags & EncryptionFlags::Audio as u8 != 0,
+			desktop: false,
 		};
 
 		if self

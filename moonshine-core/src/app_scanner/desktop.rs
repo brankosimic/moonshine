@@ -650,7 +650,6 @@ mod tests {
 	use std::fs;
 	#[cfg(unix)]
 	use std::os::unix::fs::PermissionsExt;
-	use std::sync::Mutex;
 
 	use tempfile::tempdir;
 
@@ -661,7 +660,7 @@ mod tests {
 		fs::write(path, contents).unwrap();
 	}
 
-	static ENV_MUTEX: Mutex<()> = Mutex::new(());
+	// Env-mutating tests take the crate-wide env lock (see `test_support`).
 
 	fn scanner_config(directories: Vec<PathBuf>) -> DesktopApplicationScannerConfig {
 		DesktopApplicationScannerConfig {
@@ -806,7 +805,7 @@ Exec=/usr/bin/duplicate --run
 		write_file(&explicit_icon, "png");
 		write_file(&named_icon, "png");
 
-		let _env_lock = ENV_MUTEX.lock().unwrap();
+		let _env_lock = crate::test_support::env_lock();
 		let previous_data_home = env::var_os("XDG_DATA_HOME");
 		unsafe { env::set_var("XDG_DATA_HOME", tempdir.path().join("data")) };
 
@@ -868,7 +867,7 @@ Icon=moonshine
 			fs::set_permissions(&executable, permissions).unwrap();
 		}
 
-		let _env_lock = ENV_MUTEX.lock().unwrap();
+		let _env_lock = crate::test_support::env_lock();
 		let previous_path = env::var_os("PATH");
 		unsafe { env::set_var("PATH", &bin_dir) };
 
