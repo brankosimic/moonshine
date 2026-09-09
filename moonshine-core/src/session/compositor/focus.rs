@@ -199,11 +199,20 @@ impl WindowMetadata {
 		self.app_id == crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID
 	}
 
-	/// Returns `true` if the window should fill the output. Steam counts even
-	/// without the fullscreen state set.
-	/// Gamescope: `window_is_fullscreen()`
-	pub fn is_fullscreen(&self) -> bool {
-		self.fullscreen || self.is_steam_big_picture()
+	/// Returns `true` if the window should be held at the output size.
+	///
+	/// Gamescope holds the focus window at the output size regardless of the
+	/// fullscreen hint, so a game running below the stream resolution is
+	/// scaled up to fill the whole output. Only the main window qualifies —
+	/// dialogs, dropdowns, and Steam overlay/notification windows keep their
+	/// own size.
+	pub fn should_fill_output(&self) -> bool {
+		self.has_game_id()
+			&& self.transient_for.is_none()
+			&& !self.is_dropdown()
+			&& !self
+				.flags
+				.intersects(WindowFlags::OVERLAY | WindowFlags::NOTIFICATION | WindowFlags::EXTERNAL_OVERLAY)
 	}
 
 	/// Returns `true` if the window has skipTaskbar AND skipPager but is not fullscreen.
@@ -358,14 +367,25 @@ mod tests {
 	}
 
 	#[test]
-	fn test_steam_fills_the_output_without_the_fullscreen_state() {
-		assert!(make_meta(&[("app_id", "769")]).is_fullscreen());
+	fn test_game_is_held_at_output_size_without_the_fullscreen_state() {
+		assert!(make_meta(&[("app_id", "769")]).should_fill_output());
+		assert!(make_meta(&[("app_id", "12345")]).should_fill_output());
 	}
 
 	#[test]
-	fn test_a_game_fills_the_output_only_once_it_declares_fullscreen() {
-		assert!(!make_meta(&[("app_id", "12345")]).is_fullscreen());
-		assert!(make_meta(&[("app_id", "12345"), ("fullscreen", "true")]).is_fullscreen());
+	fn test_dialog_and_dropdown_are_not_held_at_output_size() {
+		assert!(
+			!make_meta(&[
+				("app_id", "12345"),
+				("override_redirect", "true"),
+				("width", "100"),
+				("height", "100"),
+			])
+			.should_fill_output()
+		);
+		let mut m = make_meta(&[("app_id", "12345")]);
+		m.transient_for = Some(12345);
+		assert!(!m.should_fill_output());
 	}
 
 	// ---- Priority key tests (T2) ----
