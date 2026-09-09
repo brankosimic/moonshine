@@ -196,7 +196,13 @@ impl DesktopLaunchedSession {
 		let video_handle_for_resume = video_handle.clone();
 
 		let control_ctx = ControlStreamContext::new(&context, false);
-		control_stream.start(stream_timeout, control_ctx, video_handle, audio_trigger, hdr_metadata_rx);
+		control_stream.start(
+			stream_timeout,
+			control_ctx,
+			video_handle,
+			audio_trigger,
+			hdr_metadata_rx,
+		);
 
 		let sleep_inhibitor = if inhibit_sleep {
 			SleepInhibitor::acquire().await
