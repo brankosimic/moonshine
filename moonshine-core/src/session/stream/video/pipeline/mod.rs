@@ -3,7 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
-mod cpu_upload;
+mod desktop_frame;
 mod dmabuf;
 mod gpu_copy;
 mod gpu_scaler;
@@ -27,10 +27,7 @@ use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
-use cpu_upload::CpuUploader;
-use dmabuf::{DmaBufImporter, DmaBufPlane};
-use gpu_copy::map_dmabuf_plane;
-use gpu_scaler::{GpuImageScaler, GpuScaler};
+use desktop_frame::{DesktopFrameHandler, DesktopFrameResult};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
@@ -61,7 +58,7 @@ const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
-fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
+pub(super) fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	// DRM fourcc values (from drm_fourcc.h):
 	// ARGB8888 = 0x34325241, XRGB8888 = 0x34325258
 	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
@@ -704,11 +701,7 @@ impl VideoPipelineInner {
 		let idr_period = std::time::Duration::from_secs(2);
 		let mut last_idr_time = std::time::Instant::now();
 
-		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
-		let mut dmabuf_importer: Option<DmaBufImporter> = None;
-		let mut cpu_uploader: Option<CpuUploader> = None;
-		let mut scaler: Option<GpuScaler> = None;
-		let mut image_scaler: Option<GpuImageScaler> = None;
+		let mut desktop_handler: Option<DesktopFrameHandler> = None;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
@@ -913,281 +906,28 @@ impl VideoPipelineInner {
 					frame.planes.len()
 				);
 
-				// Determine Vulkan format and input format from the frame's DRM fourcc.
-				let (mut frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
-
-				let plane = match frame.planes.first() {
-					Some(p) => p,
+				let handler = match &mut desktop_handler {
+					Some(h) => h,
 					None => {
-						tracing::warn!("Received frame with no planes; dropping");
+						desktop_handler = Some(DesktopFrameHandler::new(context.clone(), ctx.width, ctx.height));
+						desktop_handler.as_mut().unwrap()
+					},
+				};
+				let (frame_result, _) = handler.handle_frame(&frame, frame.format);
+				let (source_image, src_layout, frame_input_format) = match frame_result {
+					DesktopFrameResult::Ready {
+						source_image,
+						src_layout,
+						input_format,
+					} => (source_image, src_layout, input_format),
+					DesktopFrameResult::Dropped => {
 						frame.consumed.store(true, Ordering::Release);
 						continue;
 					},
-				};
-				let mapped_ptr = plane.mapped_ptr.map(|p| p.0);
-
-				// When a CPU-visible frame needs rescaling, the GPU scaler reads
-				// straight from the mapped source pointer — uploading it through
-				// `CpuUploader` first would be a wasted full-frame CPU copy, so
-				// skip the upload/import and go directly to the scale path.
-				let size_mismatch = frame.width != ctx.width || frame.height != ctx.height;
-				let needs_scale_8bit = matches!(frame.format, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258);
-				let cpu_scale = size_mismatch && needs_scale_8bit && mapped_ptr.is_some();
-
-				let mut source_image = vk::Image::null();
-				let mut src_layout = vk::ImageLayout::UNDEFINED;
-
-				let mut upload_frame = |src_ptr: *const u8, src_size: usize| -> Result<(vk::Image, vk::ImageLayout), String> {
-					let uploader = match &mut cpu_uploader {
-						Some(u) => u,
-						None => {
-							cpu_uploader = Some(CpuUploader::new(context.clone()));
-							cpu_uploader.as_mut().unwrap()
-						},
-					};
-					let (img, needs_transition) = uploader.upload_or_reuse(
-						src_ptr,
-						src_size,
-						frame.width,
-						frame.height,
-						plane.stride,
-						import_vk_format,
-					)?;
-					Ok((
-						img,
-						if needs_transition {
-							vk::ImageLayout::UNDEFINED
-						} else {
-							vk::ImageLayout::GENERAL
-						},
-					))
-				};
-				if !cpu_scale {
-					if let Some(src_ptr) = mapped_ptr {
-						match upload_frame(src_ptr, plane.mapped_size) {
-							Ok((img, layout)) => {
-								source_image = img;
-								src_layout = layout;
-								tracing::trace!(
-									"CPU upload: {}x{} {:?}, image={:?}",
-									frame.width,
-									frame.height,
-									import_vk_format,
-									img,
-								);
-							},
-							Err(e) => {
-								tracing::warn!("CPU upload failed: {e}");
-								frame.consumed.store(true, Ordering::Release);
-								continue;
-							},
-						}
-					}
-				} else {
-					let importer = match &mut dmabuf_importer {
-						Some(imp) => imp,
-						None => match DmaBufImporter::new(context.clone()) {
-							Ok(imp) => {
-								dmabuf_importer = Some(imp);
-								dmabuf_importer.as_mut().unwrap()
-							},
-							Err(e) => {
-								tracing::warn!("Failed to create DMA-BUF importer: {e}");
-								frame.consumed.store(true, Ordering::Release);
-								continue;
-							},
-						},
-					};
-
-					// Build DmaBufPlane array from ExportedFrame planes.
-					let mut planes_buf = [DmaBufPlane {
-						fd: 0,
-						offset: 0,
-						stride: 0,
-						modifier: 0,
-					}; 4];
-					let plane_count = frame.planes.len().min(4);
-					for (i, p) in frame.planes.iter().take(4).enumerate() {
-						planes_buf[i] = DmaBufPlane {
-							fd: p.fd,
-							offset: p.offset,
-							stride: p.stride,
-							modifier: frame.modifier,
-						};
-					}
-					let planes = &planes_buf[..plane_count];
-
-					// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-					// On failure, fall back to mapping the plane and CPU-uploading it
-					// rather than dropping the frame (some drivers report no usable
-					// memory type for certain large-res portal buffers).
-					let imported = importer.import_or_reuse(
-						planes[0].fd,
-						frame.width,
-						frame.height,
-						import_vk_format,
-						planes,
-					);
-
-					match imported {
-						Ok((source_img, needs_transition)) => {
-							// First-time imports are in UNDEFINED layout; the converter
-							// will handle the transition inside its command buffer.
-							// Cached imports were left in GENERAL by the previous convert.
-							source_image = source_img;
-							src_layout = if needs_transition {
-								vk::ImageLayout::UNDEFINED
-							} else {
-								vk::ImageLayout::GENERAL
-							};
-						},
-						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}; falling back to CPU upload.");
-							let fb = map_dmabuf_plane(planes[0].fd, planes[0].offset, plane.stride, frame.height);
-							match fb {
-								Some((ptr, size)) => match upload_frame(ptr, size) {
-									Ok((img, layout)) => {
-										source_image = img;
-										src_layout = layout;
-									},
-									Err(e) => {
-										tracing::warn!("DMA-BUF CPU upload failed: {e}");
-										frame.consumed.store(true, Ordering::Release);
-										continue;
-									},
-								},
-								None => {
-									tracing::warn!("DMA-BUF plane mmap unavailable; dropping frame.");
-									frame.consumed.store(true, Ordering::Release);
-									continue;
-								},
-							}
-						},
-					};
+					DesktopFrameResult::Fatal(e) => return Err(e),
 				};
 
 				let t2_imported = std::time::Instant::now();
-
-			if size_mismatch {
-				let swap_rb = matches!(frame.format, 0x34325241 | 0x34325258);
-					if !needs_scale_8bit {
-						tracing::warn!(
-							format = frame.format,
-							"Cannot scale non-8-bit desktop capture to target resolution; encoding at native size."
-						);
-					} else if let Some(mapped_ptr) = mapped_ptr {
-						let s = match &mut scaler {
-							Some(s) => s,
-							None => match GpuScaler::new(context.clone()) {
-								Ok(s) => {
-									scaler = Some(s);
-									scaler.as_mut().unwrap()
-								},
-								Err(e) => {
-									tracing::warn!("Failed to create GPU scaler: {e}; encoding at native size.");
-									frame.consumed.store(true, Ordering::Release);
-									continue;
-								},
-							},
-						};
-					let t_scale = std::time::Instant::now();
-					match s.scale(
-						mapped_ptr,
-						frame.width,
-						frame.height,
-						plane.stride,
-						ctx.width,
-						ctx.height,
-						swap_rb,
-					) {
-						Ok(scaled_image) => {
-							tracing::debug!(scale_us = t_scale.elapsed().as_micros() as u64, "scale done");
-							source_image = scaled_image;
-							// The scaler leaves its dst in a clean GENERAL layout. Report
-							// GENERAL (NOT UNDEFINED): UNDEFINED makes the converter apply a
-							// QUEUE_FAMILY_EXTERNAL acquire, which is only valid for DMA-BUF
-							// external-memory imports. This image is a regular device-local
-							// image, so an external acquire yields a black readback.
-							src_layout = vk::ImageLayout::GENERAL;
-							frame_input_format = InputFormat::RGBA;
-							tracing::trace!(
-								"Scaled desktop frame {}x{} -> {}x{} (letterboxed)",
-								frame.width,
-								frame.height,
-								ctx.width,
-								ctx.height,
-							);
-						},
-						Err(e) => {
-							let device_lost = e.to_lowercase().contains("device has been lost");
-							if device_lost {
-								return Err(format!("GPU scale failed: {e}"));
-							}
-							tracing::warn!("GPU scale failed: {e}; encoding at native size.");
-							// The up-front upload was skipped on the CPU-scale path, so
-							// there is no source image yet: upload now to encode at
-							// native size instead of feeding a null image to the converter.
-							if cpu_scale {
-								match upload_frame(mapped_ptr, plane.mapped_size) {
-									Ok((img, layout)) => {
-										source_image = img;
-										src_layout = layout;
-									},
-									Err(e) => {
-										tracing::warn!("CPU upload fallback failed: {e}");
-										frame.consumed.store(true, Ordering::Release);
-										continue;
-									},
-								}
-							}
-						},
-					}
-				} else {
-					let img_scaler = match &mut image_scaler {
-							Some(s) => s,
-							None => match GpuImageScaler::new(context.clone()) {
-								Ok(s) => {
-									image_scaler = Some(s);
-									image_scaler.as_mut().unwrap()
-								},
-								Err(e) => {
-									tracing::warn!("Failed to create GPU image scaler: {e}; encoding at native size.");
-									frame.consumed.store(true, Ordering::Release);
-									continue;
-								},
-							},
-						};
-						match img_scaler.scale(
-							source_image,
-							import_vk_format,
-							src_layout,
-							frame.width,
-							frame.height,
-							ctx.width,
-							ctx.height,
-						) {
-							Ok(scaled_image) => {
-								source_image = scaled_image;
-								src_layout = vk::ImageLayout::GENERAL;
-								frame_input_format = InputFormat::RGBA;
-								tracing::trace!(
-									"GPU-scaled desktop frame {}x{} -> {}x{}",
-									frame.width,
-									frame.height,
-									ctx.width,
-									ctx.height,
-								);
-							},
-							Err(e) => {
-								let device_lost = e.to_lowercase().contains("device has been lost");
-								if device_lost {
-									return Err(format!("GPU scale failed: {e}"));
-								}
-								tracing::warn!("GPU scale failed: {e}; encoding at native size.");
-							},
-						}
-					}
-				}
 
 				// Recreate the converter if the input format changed (e.g. GBM pool
 				// ABGR2101010 → direct scanout XBGR8888). The converter's image view

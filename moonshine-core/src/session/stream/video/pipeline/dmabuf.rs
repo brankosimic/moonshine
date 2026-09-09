@@ -141,6 +141,7 @@ pub(crate) struct DmaBufImporter {
 	retired: Vec<CachedImport>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
+	failed: HashMap<RawFd, ImportParams>,
 }
 
 impl DmaBufImporter {
@@ -154,6 +155,7 @@ impl DmaBufImporter {
 			cache: HashMap::new(),
 			retired: Vec::new(),
 			calls_since_sweep: 0,
+			failed: HashMap::new(),
 		})
 	}
 
@@ -177,6 +179,15 @@ impl DmaBufImporter {
 
 		let params = ImportParams::new(width, height, format, planes);
 
+		if let Some(failed_params) = self.failed.get(&fd)
+			&& *failed_params == params
+		{
+			return Err(format!(
+				"DMA-BUF import previously failed for fd {fd} ({}x{}, format={:?}); not retrying",
+				width, height, format
+			));
+		}
+
 		let now = Instant::now();
 		if let Some(cached) = self.cache.get_mut(&fd)
 			&& cached.params == params
@@ -197,6 +208,7 @@ impl DmaBufImporter {
 			stale.last_used = now;
 			self.retired.push(stale);
 		}
+		self.failed.remove(&fd);
 
 		debug!(
 			"First import for fd {fd}: {}x{}, format={:?}, stride={}, modifier={:#x}",
@@ -208,7 +220,13 @@ impl DmaBufImporter {
 			.try_clone_to_owned()
 			.map_err(|e| format!("Failed to duplicate DMA-BUF FD for the import cache: {e}"))?;
 
-		let (image, memory) = self.import_internal(width, height, format, planes)?;
+		let (image, memory) = match self.import_internal(width, height, format, planes) {
+			Ok(v) => v,
+			Err(e) => {
+				self.failed.insert(fd, params);
+				return Err(e);
+			},
+		};
 
 		self.cache.insert(
 			fd,
@@ -346,16 +364,19 @@ impl DmaBufImporter {
 		{
 			Some(idx) => idx,
 			None => {
-				diagnose_dmabuf_import_failure(&self.context, ImportDiag {
-					fd,
-					width,
-					height,
-					format,
-					modifier,
-					image_bits: mem_requirements.memory_type_bits,
-					fd_bits: memory_fd_properties.memory_type_bits,
-					size: mem_requirements.size,
-				});
+				diagnose_dmabuf_import_failure(
+					&self.context,
+					ImportDiag {
+						fd,
+						width,
+						height,
+						format,
+						modifier,
+						image_bits: mem_requirements.memory_type_bits,
+						fd_bits: memory_fd_properties.memory_type_bits,
+						size: mem_requirements.size,
+					},
+				);
 				return Err(format!(
 					"No suitable memory type for DMA-BUF import (image_bits={:#x}, fd_bits={:#x}, combined={:#x}, size={})",
 					mem_requirements.memory_type_bits,

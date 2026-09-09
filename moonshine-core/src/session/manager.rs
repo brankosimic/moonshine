@@ -3,7 +3,6 @@ use std::sync::Arc;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
 
-use crate::ShutdownReason;
 use super::FrameStats;
 use super::InitializedSession;
 use super::SessionContext;
@@ -11,13 +10,14 @@ use super::SessionKeyData;
 use super::SessionKeys;
 use super::SessionKeysSender;
 use super::SessionState;
-use super::desktop_session;
 use super::compositor::CompositorConfig;
+use super::desktop_session;
 use super::stream::audio::AudioStreamConfig;
 use super::stream::audio::AudioStreamContext;
 use super::stream::control::ControlStreamConfig;
 use super::stream::video::VideoStreamConfig;
 use super::stream::video::VideoStreamContext;
+use crate::ShutdownReason;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
@@ -378,8 +378,18 @@ impl SessionManager {
 			let video_stream_context = guard.video_stream_context.take();
 			let audio_stream_context = guard.audio_stream_context.take();
 			match guard.session.take() {
-				Some(SessionState::Launched(s)) => (desktop_session::LaunchedState::Regular(s), video_stream_context, audio_stream_context, guard.stop.clone()),
-				Some(SessionState::DesktopLaunched(s)) => (desktop_session::LaunchedState::Desktop(s), video_stream_context, audio_stream_context, guard.stop.clone()),
+				Some(SessionState::Launched(s)) => (
+					desktop_session::LaunchedState::Regular(s),
+					video_stream_context,
+					audio_stream_context,
+					guard.stop.clone(),
+				),
+				Some(SessionState::DesktopLaunched(s)) => (
+					desktop_session::LaunchedState::Desktop(s),
+					video_stream_context,
+					audio_stream_context,
+					guard.stop.clone(),
+				),
 				Some(SessionState::Initialized(s)) => {
 					guard.session = Some(SessionState::Initialized(s));
 					tracing::warn!("StartSession rejected: session not yet launched");

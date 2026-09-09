@@ -572,10 +572,7 @@ fn run_capture_inner(
 			.iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
 	}
 
-	let _ = ready_tx.send(Ok(DesktopReady {
-		resolution,
-		stream_id,
-	}));
+	let _ = ready_tx.send(Ok(DesktopReady { resolution, stream_id }));
 
 	loop {
 		if stop_rx.try_recv().is_ok() {
