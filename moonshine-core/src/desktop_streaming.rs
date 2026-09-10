@@ -13,6 +13,8 @@
 use std::env;
 use std::time::Duration;
 
+use tokio::runtime;
+
 use crate::session::application::ApplicationConfig;
 use crate::session::stream::DesktopMode;
 
@@ -70,21 +72,30 @@ async fn desktop_capture_supported() -> Option<bool> {
 	Some(kwin && (portal || kde_portal))
 }
 
-/// Synchronous wrapper: probe D-Bus on a short-lived runtime.
+/// Probe D-Bus, tolerating being called from inside a runtime.
 ///
-/// `inject_desktop_app` runs during startup (before the async runtime is
-/// necessarily up), so this spins a minimal single-thread runtime just for
-/// the probe. A D-Bus timeout or missing bus maps to `false`.
+/// A D-Bus timeout or missing bus maps to `false`.
 pub fn detect_desktop_session() -> bool {
-	let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-		return false;
-	};
-	runtime.block_on(async {
+	let probe = || async {
 		match tokio::time::timeout(Duration::from_secs(2), desktop_capture_supported()).await {
 			Ok(Some(true)) => true,
 			Ok(Some(false)) | Ok(None) | Err(_) => false,
 		}
-	})
+	};
+	if runtime::Handle::try_current().is_ok() {
+		return std::thread::spawn(move || {
+			let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+				return false;
+			};
+			runtime.block_on(probe())
+		})
+		.join()
+		.unwrap_or(false);
+	}
+	let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+		return false;
+	};
+	runtime.block_on(probe())
 }
 
 fn desktop_boxart_path() -> Option<std::path::PathBuf> {

@@ -289,3 +289,36 @@ impl DesktopFrameHandler {
 		}
 	}
 }
+
+/// Coalesces client reference-frame-invalidation (RFI) requests for desktop
+/// streams: a desynced client re-requests at up to report rate, and honoring
+/// each with a full IDR amplifies the very packet loss that caused the
+/// desync. One IDR per cooldown window is always enough to resync.
+pub(crate) struct InvalidationCoalescer {
+	last_invalidation_time: std::time::Instant,
+}
+
+impl InvalidationCoalescer {
+	const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
+
+	pub(crate) fn new() -> Self {
+		Self {
+			last_invalidation_time: std::time::Instant::now() - Self::COOLDOWN,
+		}
+	}
+
+	/// Whether a drained batch of invalidation requests should be honored now.
+	/// `first` is the earliest requested display order, if any request carried
+	/// a frame range (a lag-only batch has none and just needs an IDR).
+	pub(crate) fn should_honor(&mut self, first: Option<u64>) -> bool {
+		if self.last_invalidation_time.elapsed() < Self::COOLDOWN {
+			tracing::debug!(
+				"Coalescing desktop reference-frame invalidation within {}ms cooldown (pending range: {first:?}); resync IDR already in flight",
+				Self::COOLDOWN.as_millis(),
+			);
+			return false;
+		}
+		self.last_invalidation_time = std::time::Instant::now();
+		true
+	}
+}
