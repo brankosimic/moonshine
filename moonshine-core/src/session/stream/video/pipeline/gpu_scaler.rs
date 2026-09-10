@@ -3,8 +3,10 @@ use pixelforge::VideoContext;
 
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
 	bytes
-		.chunks_exact(4)
-		.map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+		.as_chunks::<4>()
+		.0
+		.iter()
+		.map(|c| u32::from_le_bytes(*c))
 		.collect()
 }
 
@@ -1088,6 +1090,7 @@ impl GpuImageScaler {
 		Ok(self.target.as_ref().expect("target just created"))
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub fn scale(
 		&mut self,
 		src: vk::Image,
@@ -1510,10 +1513,10 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 
 	let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 	let ok = (|| -> bool {
-		if let Err(_) = unsafe { device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) } {
+		if unsafe { device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }.is_err() {
 			return false;
 		}
-		if let Err(_) = unsafe { device.begin_command_buffer(cb, &begin_info) } {
+		if unsafe { device.begin_command_buffer(cb, &begin_info) }.is_err() {
 			return false;
 		}
 		unsafe {
@@ -1537,16 +1540,14 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 				&[back_to_general],
 			);
 		}
-		if let Err(_) = unsafe { device.end_command_buffer(cb) } {
+		if unsafe { device.end_command_buffer(cb) }.is_err() {
 			return false;
 		}
 		let queue = context.compute_queue();
-		if let Err(_) =
-			unsafe { device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cb])], fence) }
-		{
+		if unsafe { device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cb])], fence) }.is_err() {
 			return false;
 		}
-		if let Err(_) = unsafe { device.wait_for_fences(&[fence], true, 2_000_000_000) } {
+		if unsafe { device.wait_for_fences(&[fence], true, 2_000_000_000) }.is_err() {
 			return false;
 		}
 		true
