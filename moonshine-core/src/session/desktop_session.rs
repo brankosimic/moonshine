@@ -14,8 +14,8 @@ use super::stream::video::{FrameStats, VideoStream, VideoStreamConfig, VideoStre
 
 /// Wrapper for launched session states (regular or desktop).
 pub(crate) enum LaunchedState {
-	Regular(super::LaunchedSession),
-	Desktop(DesktopLaunchedSession),
+	Regular(Box<super::LaunchedSession>),
+	Desktop(Box<DesktopLaunchedSession>),
 }
 
 impl LaunchedState {
@@ -33,13 +33,13 @@ impl LaunchedState {
 				let (active, video_notify, audio_notify) = session
 					.start(video_config, stream_timeout, video_ctx, audio_ctx, stop, inhibit_sleep)
 					.await?;
-				Ok((ActiveState::Regular(active), video_notify, audio_notify))
+				Ok((ActiveState::Regular(Box::new(active)), video_notify, audio_notify))
 			},
 			Self::Desktop(session) => {
 				let (active, video_notify, audio_notify) = session
 					.start(video_config, stream_timeout, video_ctx, audio_ctx, stop, inhibit_sleep)
 					.await?;
-				Ok((ActiveState::Desktop(active), video_notify, audio_notify))
+				Ok((ActiveState::Desktop(Box::new(active)), video_notify, audio_notify))
 			},
 		}
 	}
@@ -47,8 +47,8 @@ impl LaunchedState {
 
 /// Wrapper for active session states (regular or desktop).
 pub(crate) enum ActiveState {
-	Regular(super::ActiveSession),
-	Desktop(DesktopActiveSession),
+	Regular(Box<super::ActiveSession>),
+	Desktop(Box<DesktopActiveSession>),
 }
 
 pub(crate) struct DesktopInitializedSession {

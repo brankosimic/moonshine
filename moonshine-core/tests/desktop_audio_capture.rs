@@ -92,7 +92,8 @@ async fn records_monitor_of_default_sink() {
 		.0
 		.iter()
 		.map(|c| f32::from_le_bytes(*c))
-		.collect();	assert!(samples.iter().all(|s| s.is_finite()));
+		.collect();
+	assert!(samples.iter().all(|s| s.is_finite()));
 }
 
 /// The record buffer must block (not spin/EOF) when no data has arrived yet.

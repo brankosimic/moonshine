@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `stream.video.max_packet_size` to clamp the client's video packet size, avoiding fragmentation over VPNs and tunnels.
 - Support Windows BT.2100 image descriptions. (#214, @urwrstkn8mare)
 
+### Added
+
+- Desktop streaming: stream the current KDE Plasma Wayland desktop (with remote input and system audio capture) instead of launching a game in an isolated compositor, via the XDG desktop portal (ScreenCast + RemoteDesktop over PipeWire). Opt-in per host with `[stream] desktop = "Auto" | "On" | "Off"` (default `Auto`); a `Desktop` entry appears in the client's app list when the capture stack is available. See the README's "Desktop streaming" section for requirements and limitations.
+
 ### Fixed
 
 - Port gamescope's focus selection and output scaling, fixing focus handling and Steam overlay input for native Wayland windows, X11 clients and override windows, flushing gamescope focus properties and refreshing overlay state on property changes. (#212, #214, @urwrstkn8mare, @baberabb)
@@ -53,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make application IDs positive so they are accepted by the Moonlight web client. (#197, @BigDiaB)
 - Ignore the null and unmapped keyboard packets some clients send for touch input, which previously flooded the logs. (#175, @antomanc)
 - Disable nixpkgs' bundled `services/networking/moonshine.nix` from the NixOS module so it can be enabled without conflicting with the upstream module. (#187, #190, @amateurattentionseeker)
+- Use `fail` instead of `replace` as the systemd job mode when starting Plasma sessions, avoiding a `TransactionIsDestructive` conflict where Plasma's systemd integration tears down `graphical-session.target` mid-launch.
 - Read GOG install state from Heroic's `gog_store/installed.json`, which Heroic strips out of the library cache, so the Heroic scanner no longer skips every installed GOG game. (#169, @scottjab)
 - Prefer Heroic's cached cover art over its shortcut icons, so GOG games no longer show a small square store logo as their box art. (#169, @scottjab)
 - Warn when the Heroic store cache cannot be read. (#169, @scottjab)

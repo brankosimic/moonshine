@@ -17,8 +17,10 @@ runs:
           libevdev-dev \
           libgbm-dev \
           libopus-dev \
+          libpipewire-dev \
           libwayland-dev \
           libxkbcommon-dev \
           patchelf \
-          pkg-config
+          pkg-config \
+          glslc
       shell: bash

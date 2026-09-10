@@ -326,10 +326,10 @@ impl SessionManager {
 			let mut guard = self.inner.lock().await;
 			match guard.session.take() {
 				Some(SessionState::Initialized(session)) => {
-					desktop_session::LaunchedState::Regular(session.launch().await?)
+					desktop_session::LaunchedState::Regular(Box::new(session.launch().await?))
 				},
 				Some(SessionState::DesktopInitialized(session)) => {
-					desktop_session::LaunchedState::Desktop(session.launch().await?)
+					desktop_session::LaunchedState::Desktop(session.launch().await.map(Box::new)?)
 				},
 				Some(SessionState::Launched(launched)) => {
 					guard.session = Some(SessionState::Launched(launched));
@@ -361,8 +361,8 @@ impl SessionManager {
 		tracing::info!("Launching session (starting compositor and app).");
 		let mut guard = self.inner.lock().await;
 		guard.session = match launched {
-			desktop_session::LaunchedState::Regular(s) => Some(SessionState::Launched(s)),
-			desktop_session::LaunchedState::Desktop(s) => Some(SessionState::DesktopLaunched(s)),
+			desktop_session::LaunchedState::Regular(s) => Some(SessionState::Launched(*s)),
+			desktop_session::LaunchedState::Desktop(s) => Some(SessionState::DesktopLaunched(*s)),
 		};
 		tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
 		Ok(())
@@ -379,13 +379,13 @@ impl SessionManager {
 			let audio_stream_context = guard.audio_stream_context.take();
 			match guard.session.take() {
 				Some(SessionState::Launched(s)) => (
-					desktop_session::LaunchedState::Regular(s),
+					desktop_session::LaunchedState::Regular(Box::new(s)),
 					video_stream_context,
 					audio_stream_context,
 					guard.stop.clone(),
 				),
 				Some(SessionState::DesktopLaunched(s)) => (
-					desktop_session::LaunchedState::Desktop(s),
+					desktop_session::LaunchedState::Desktop(Box::new(s)),
 					video_stream_context,
 					audio_stream_context,
 					guard.stop.clone(),
@@ -451,8 +451,8 @@ impl SessionManager {
 			)
 			.await?;
 		guard.session = Some(match active {
-			desktop_session::ActiveState::Regular(a) => SessionState::Active(a),
-			desktop_session::ActiveState::Desktop(a) => SessionState::DesktopActive(a),
+			desktop_session::ActiveState::Regular(a) => SessionState::Active(*a),
+			desktop_session::ActiveState::Desktop(a) => SessionState::DesktopActive(*a),
 		});
 		guard.video_start_notify = Some(video_notify);
 		guard.audio_start_notify = Some(audio_notify);

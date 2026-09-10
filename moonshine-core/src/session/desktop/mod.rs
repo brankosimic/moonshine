@@ -1001,14 +1001,14 @@ mod tests {
 		let values = build_enum_format_pod((1920, 1080), 60).expect("pod must serialize");
 		let pod = pw::spa::pod::Pod::from_bytes(&values).expect("serialized pod must parse");
 		let (media_type, media_subtype) =
-			spa::param::format_utils::parse_format(&pod).expect("pod must parse as format");
+			spa::param::format_utils::parse_format(pod).expect("pod must parse as format");
 		assert_eq!(media_type.as_raw(), spa::param::format::MediaType::Video.as_raw());
 		assert_eq!(media_subtype.as_raw(), spa::param::format::MediaSubtype::Raw.as_raw());
 
 		// The stream connect path parses it back into a VideoInfoRaw; ensure
 		// the advertised size survives a full negotiation round-trip.
 		let mut info = spa::param::video::VideoInfoRaw::new();
-		info.parse(&pod).expect("VideoInfoRaw must parse the EnumFormat pod");
+		info.parse(pod).expect("VideoInfoRaw must parse the EnumFormat pod");
 	}
 
 	#[test]
@@ -1018,7 +1018,7 @@ mod tests {
 		let values = build_enum_format_pod((640, 480), 10_000).expect("pod must serialize");
 		let pod = pw::spa::pod::Pod::from_bytes(&values).expect("pod must parse");
 		let mut info = spa::param::video::VideoInfoRaw::new();
-		info.parse(&pod).expect("clamped pod must still parse");
+		info.parse(pod).expect("clamped pod must still parse");
 	}
 
 	#[test]
@@ -1100,7 +1100,7 @@ mod tests {
 		spa_buffer.datas = datas.as_mut_ptr();
 		buffer.buffer = &mut spa_buffer;
 
-		f(&mut buffer as *mut _)
+		f(std::ptr::from_mut(&mut buffer))
 	}
 
 	#[test]
@@ -1119,7 +1119,7 @@ mod tests {
 		let plane = with_pw_buffer(1, |buf| unsafe {
 			let spa_buffer = (*buf).buffer;
 			let data = &mut *(*spa_buffer).datas;
-			data.type_ = pw::spa::sys::SPA_DATA_DmaBuf as u32;
+			data.type_ = pw::spa::sys::SPA_DATA_DmaBuf;
 			data.fd = 42;
 			(*data.chunk).offset = 256;
 			(*data.chunk).stride = 7680;
@@ -1138,7 +1138,7 @@ mod tests {
 		let plane = with_pw_buffer(1, |buf| unsafe {
 			let spa_buffer = (*buf).buffer;
 			let data = &mut *(*spa_buffer).datas;
-			data.type_ = pw::spa::sys::SPA_DATA_DmaBuf as u32;
+			data.type_ = pw::spa::sys::SPA_DATA_DmaBuf;
 			data.fd = -1;
 			buffer_plane(buf)
 		});
@@ -1152,7 +1152,7 @@ mod tests {
 		let plane = with_pw_buffer(1, |buf| unsafe {
 			let spa_buffer = (*buf).buffer;
 			let data = &mut *(*spa_buffer).datas;
-			data.type_ = pw::spa::sys::SPA_DATA_MemPtr as u32;
+			data.type_ = pw::spa::sys::SPA_DATA_MemPtr;
 			data.data = sample.as_ptr() as *mut std::os::raw::c_void;
 			(*data.chunk).offset = 0;
 			(*data.chunk).size = 4;
@@ -1171,8 +1171,8 @@ mod tests {
 		let plane = with_pw_buffer(1, |buf| unsafe {
 			let spa_buffer = (*buf).buffer;
 			let data = &mut *(*spa_buffer).datas;
-			data.type_ = pw::spa::sys::SPA_DATA_MemPtr as u32;
-			data.data = 1 as *mut std::os::raw::c_void; // non-null
+			data.type_ = pw::spa::sys::SPA_DATA_MemPtr;
+			data.data = std::ptr::dangling_mut::<std::os::raw::c_void>(); // non-null
 			(*data.chunk).size = 0; // but empty
 			buffer_plane(buf)
 		});
