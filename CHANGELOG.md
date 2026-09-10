@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Desktop streaming: stream the current KDE Plasma Wayland desktop (with remote input and system audio capture) instead of launching a game in an isolated compositor, via the XDG desktop portal (ScreenCast + RemoteDesktop over PipeWire). Opt-in per host with `[stream] desktop = "Auto" | "On" | "Off"` (default `Auto`); a `Desktop` entry appears in the client's app list when the capture stack is available. See the README's "Desktop streaming" section for requirements and limitations.
+
 ### Fixed
 
+- Use `fail` instead of `replace` as the systemd job mode when starting Plasma sessions, avoiding a `TransactionIsDestructive` conflict where Plasma's systemd integration tears down `graphical-session.target` mid-launch.
 - Read GOG install state from Heroic's `gog_store/installed.json`, which Heroic strips out of the library cache, so the Heroic scanner no longer skips every installed GOG game. (#169, @scottjab)
 - Prefer Heroic's cached cover art over its shortcut icons, so GOG games no longer show a small square store logo as their box art. (#169, @scottjab)
 

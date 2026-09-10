@@ -3,6 +3,7 @@
   rustPlatform,
   addDriverRunpath,
   cmake,
+  glslc,
   pkg-config,
   libdrm,
   libevdev,
@@ -10,6 +11,7 @@
   libxkbcommon,
   libgbm,
   libopus,
+  pipewire,
   vulkan-loader,
   wayland,
   libglvnd,
@@ -99,6 +101,7 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     addDriverRunpath # see postFixup
     cmake # inputtino-sys and aws-lc-sys build their C/C++ via cmake
+    glslc # moonshine-core's build.rs compiles shader/scaler.comp to SPIR-V
     pkg-config
     rustPlatform.bindgenHook # inputtino-sys generates its bindings at build time
   ];
@@ -114,6 +117,7 @@ rustPlatform.buildRustPackage {
     libxkbcommon
     libgbm # smithay's GPU buffer allocation (split out of mesa in nixpkgs)
     libopus
+    pipewire # desktop-streaming capture (pipewire-sys links -lpipewire-0.3)
     vulkan-loader
     wayland
   ];

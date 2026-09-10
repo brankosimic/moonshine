@@ -608,6 +608,7 @@ async fn run_benchmark(
 		qos: false,
 		audio_config: AudioConfig::default(),
 		encrypt_audio: false,
+		desktop: false,
 	};
 
 	tracing::info!("Setting stream contexts...");

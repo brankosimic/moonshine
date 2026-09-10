@@ -8,6 +8,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 ## Features
 
 - **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
+- **Desktop streaming** *(optional)*: Stream your current KDE Plasma Wayland desktop with full remote input, like Sunshine — see [Desktop streaming](#desktop-streaming).
 - **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
 - **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
 - **HDR support**: True 10-bit HDR streaming for supported games.
@@ -276,6 +277,36 @@ Box art is automatically loaded from Heroic's `images-cache/` directory for any 
 
 The default configuration directory is `~/.config/heroic`, falling back to `~/.var/app/com.heroicgameslauncher.hgl/config/heroic` when only the Flatpak is installed.
 You can override it with the `config_dir` option.
+
+### Desktop streaming
+
+Besides isolated game sessions, Moonshine can stream your **current desktop session** (like Sunshine does) instead of launching a game in its own compositor.
+This is useful when you want to interact with your existing Plasma desktop remotely.
+
+When enabled, a `Desktop` entry appears in your client's app list.
+Streaming it captures your monitors via the XDG desktop portal (PipeWire) and forwards keyboard, mouse and touch input back to your session — you control the host desktop directly.
+
+```toml
+[stream]
+desktop = "Auto"  # "Auto" (default) | "On" | "Off"
+```
+
+- `Auto` — expose the `Desktop` entry only when Moonshine runs inside a KDE Plasma Wayland session with the capture portal available.
+- `On` — expose the `Desktop` entry whenever the capture stack is reachable, regardless of which desktop environment is running.
+- `Off` — never expose it.
+
+Notes and limitations:
+
+- **KDE Plasma Wayland only.** Capture and remote input go through the `org.freedesktop.impl.portal.desktop.kde` portal backend; other desktop environments are not supported by the `Auto` detection (`On` may still work if your portal implements ScreenCast/RemoteDesktop).
+- **A consent dialog appears on the host at the start of every desktop stream** (the portal asks you to confirm screen sharing and input control). The host must have an unlocked session for the stream to start; desktop streaming does not work fully headless.
+- **SDR only.** HDR desktops are streamed as SDR.
+- **System audio is captured** (what you hear on the host), not a private audio sink — unlike game sessions, which get their own PulseAudio server.
+- The capture resolution is your monitor's native resolution; when it differs from the resolution negotiated with the client, the stream is letterboxed to preserve aspect ratio, and input is mapped accordingly.
+
+> [!WARNING]
+> Unlike isolated game sessions, desktop streaming exposes your **real desktop session** — including any windows that happen to be open and everything audible on the host — to the paired client.
+> Only enable it if you trust the clients you pair with Moonshine.
+> Moonshine is **not designed for use on public networks**; see [Security](#security).
 
 ## Tips & Tricks
 

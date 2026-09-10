@@ -59,6 +59,7 @@ overrides:
       - libstdc++6
       - libgcc-s1
       - libwayland-client0
+      - libpipewire-0.3-0
       - xwayland
   rpm:
     depends:
@@ -70,4 +71,5 @@ overrides:
       - libstdc++
       - libgcc
       - libwayland-client
+      - pipewire-libs
       - xorg-x11-server-Xwayland

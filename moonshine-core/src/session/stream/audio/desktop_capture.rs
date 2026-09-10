@@ -525,7 +525,6 @@ mod fake_server_tests {
 			frame.buf.iter().all(|s| (*s - 0.25).abs() < 1e-6),
 			"samples must round-trip"
 		);
-		assert!(frame.capture_ts_ms > 0 || frame.capture_ts_ms == 0); // field is set
 
 		// Server EOF after the frame: capture exits with an error (stream
 		// ended), never a hang — the caller treats this as best-effort stop.
