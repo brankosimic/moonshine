@@ -15,7 +15,6 @@ use pipewire as pw;
 use pw::spa;
 use pw::spa::pod::PropertyFlags;
 use pw::spa::pod::serialize::PodSerializer;
-use pw::spa::utils::Id;
 
 use crate::session::SessionContext;
 use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace};
@@ -57,6 +56,12 @@ fn build_buffers_param(data_type_mask: i32, prefer_linear: bool) -> Vec<u8> {
 
 /// Serialize the EnumFormat POD advertising raw video capture capabilities:
 /// BGRx/RGBx/BGRA/RGBA at `resolution` and up to `refresh_rate` fps.
+///
+/// No `modifier` property is advertised: on producers that cannot export
+/// DMA-BUF (kwin with the NVIDIA GBM backend) a DONT_FIXATE modifier choice
+/// makes the fixate step loop and no buffer is ever delivered. Producers
+/// then fixate to linear with a shared-memory (MemFd) copy, which the
+/// CPU-upload path handles.
 fn build_enum_format_pod(resolution: (u32, u32), refresh_rate: u32) -> Result<Vec<u8>, String> {
 	let (w, h) = resolution;
 	let fps = refresh_rate.min(1000);
@@ -321,6 +326,7 @@ struct Shared {
 	pending: Vec<PendingFrame>,
 	next_index: u64,
 	info: Option<spa::param::video::VideoInfoRaw>,
+	last_handoff: Option<Instant>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -394,6 +400,7 @@ fn run_capture_inner(
 		pending: Vec::new(),
 		next_index: 0,
 		info: None,
+		last_handoff: None,
 	}));
 
 	let _listener = stream
@@ -439,19 +446,11 @@ fn run_capture_inner(
 				"Desktop capture format negotiated"
 			);
 
-			let buffer_types = if param
-				.as_object()
-				.ok()
-				.and_then(|obj| obj.find_prop(Id(pw::spa::sys::SPA_FORMAT_VIDEO_modifier)))
-				.is_some()
-			{
-				tracing::info!("Requesting DMA-BUF capture buffers (preferring linear layout)");
-				1 << pw::spa::sys::SPA_DATA_DmaBuf
-			} else {
-				tracing::info!("Requesting memory capture buffers");
-				1 << pw::spa::sys::SPA_DATA_MemPtr
-			};
-			let prefer_linear = buffer_types & (1 << pw::spa::sys::SPA_DATA_DmaBuf) != 0;
+			let buffer_types = (1 << pw::spa::sys::SPA_DATA_DmaBuf)
+				| (1 << pw::spa::sys::SPA_DATA_MemFd)
+				| (1 << pw::spa::sys::SPA_DATA_MemPtr);
+			tracing::info!(buffer_types, "Advertising capture buffer types (DMA-BUF preferred)");
+			let prefer_linear = true;
 			let pod_bytes = build_buffers_param(buffer_types, prefer_linear);
 			let Some(buffers_pod) = pw::spa::pod::Pod::from_bytes(&pod_bytes) else {
 				tracing::warn!("Failed to parse serialized buffers param");
@@ -492,12 +491,18 @@ fn run_capture_inner(
 				return;
 			};
 
+			let min_interval = Duration::from_secs_f64(0.95 / (refresh_rate.max(1) as f64));
+
 			loop {
 				let buf = unsafe { stream.dequeue_raw_buffer() };
 				if buf.is_null() {
 					break;
 				}
 
+				if shared.last_handoff.is_some_and(|last| last.elapsed() < min_interval) {
+					unsafe { stream.queue_raw_buffer(buf) };
+					continue;
+				}
 				let Some(plane) = (unsafe { buffer_plane(buf) }) else {
 					unsafe { stream.queue_raw_buffer(buf) };
 					continue;
@@ -534,6 +539,7 @@ fn run_capture_inner(
 
 				match shared.frame_tx.try_send(frame) {
 					Ok(()) => {
+						shared.last_handoff = Some(Instant::now());
 						shared.pending.push(PendingFrame { buf, consumed, unmap });
 						write_eventfd(wake_raw);
 					},
@@ -930,6 +936,7 @@ async fn forward_input(
 mod tests {
 	use super::*;
 	use crate::desktop_streaming::desktop_application;
+	use pw::spa::utils::Id;
 
 	#[test]
 	fn desktop_application_entry_is_marked_desktop() {

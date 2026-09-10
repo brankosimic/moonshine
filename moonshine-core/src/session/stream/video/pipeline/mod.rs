@@ -27,7 +27,7 @@ use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
-use desktop_frame::{DesktopFrameHandler, DesktopFrameResult};
+use desktop_frame::{DesktopFrameHandler, DesktopFrameResult, InvalidationCoalescer};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
@@ -698,13 +698,22 @@ impl VideoPipelineInner {
 		// is lost), a decoder that falls out of sync has no way to resync and stays
 		// black. A periodic IDR guarantees a fresh keyframe every few seconds, giving
 		// the stream a resync point independent of client behaviour.
-		let idr_period = std::time::Duration::from_secs(2);
+		// Desktop sessions stretch the backstop: a high-bitrate keyframe is a
+		// burst of UDP packets that on lossy links (WiFi) itself causes loss
+		// → client RFI → another keyframe. Games keep the short period.
+		let idr_period = if ctx.desktop_mode {
+			std::time::Duration::from_secs(10)
+		} else {
+			std::time::Duration::from_secs(2)
+		};
 		let mut last_idr_time = std::time::Instant::now();
 
 		let mut desktop_handler: Option<DesktopFrameHandler> = None;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
+
+		let mut invalidation_coalescer = ctx.desktop_mode.then(InvalidationCoalescer::new);
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
@@ -806,6 +815,8 @@ impl VideoPipelineInner {
 			// falls back to an IDR when *no* reference survives) leaves a fully
 			// desynced client black: it still gets P-frames referencing pictures it
 			// never had, and keeps re-requesting invalidation forever.
+			let mut invalidation_first: Option<u64> = None;
+			let mut saw_invalidation = false;
 			loop {
 				match invalidate_request_rx.try_recv() {
 					Ok((first, _last)) => {
@@ -813,20 +824,29 @@ impl VideoPipelineInner {
 						tracing::debug!(
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order}); forcing IDR"
 						);
-						encoder.invalidate_reference_frames(first_display_order);
-						encoder.request_idr();
-						pending_idr = true;
-						last_idr_time = std::time::Instant::now();
+						saw_invalidation = true;
+						invalidation_first =
+							Some(invalidation_first.map_or(first_display_order, |e: u64| e.min(first_display_order)));
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
 						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
-						encoder.request_idr();
-						pending_idr = true;
-						last_idr_time = std::time::Instant::now();
+						saw_invalidation = true;
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
+			}
+			if saw_invalidation
+				&& invalidation_coalescer
+					.as_mut()
+					.is_none_or(|c| c.should_honor(invalidation_first))
+			{
+				if let Some(first_display_order) = invalidation_first {
+					encoder.invalidate_reference_frames(first_display_order);
+				}
+				encoder.request_idr();
+				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
 			}
 
 			// Try to receive a frame from compositor (with timeout).
