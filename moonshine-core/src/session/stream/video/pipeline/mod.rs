@@ -3,7 +3,10 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod desktop_frame;
 mod dmabuf;
+mod gpu_copy;
+mod gpu_scaler;
 mod hdr_sei;
 
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
-use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
+use desktop_frame::{DesktopFrameHandler, DesktopFrameResult, InvalidationCoalescer};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
@@ -46,6 +49,8 @@ use pixelforge::{
 /// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
+const DESKTOP_MAX_FRAMES_IN_FLIGHT: usize = 4;
+
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 /// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
@@ -53,7 +58,7 @@ const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
-fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
+pub(super) fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	// DRM fourcc values (from drm_fourcc.h):
 	// ARGB8888 = 0x34325241, XRGB8888 = 0x34325258
 	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
@@ -638,8 +643,14 @@ impl VideoPipelineInner {
 		// `MAX_FRAMES_IN_FLIGHT`); the consumer decrements it per frame. The channel
 		// is sized just above that gate so it never actually blocks the producer —
 		// admission is governed by the drop gate, not by the channel filling.
+		let max_in_flight = if ctx.desktop_mode {
+			DESKTOP_MAX_FRAMES_IN_FLIGHT
+		} else {
+			MAX_FRAMES_IN_FLIGHT
+		};
+
 		let in_flight = Arc::new(AtomicUsize::new(0));
-		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(max_in_flight + 2);
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
@@ -673,19 +684,36 @@ impl VideoPipelineInner {
 			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
 		};
 
-		// Converter per input format, plus the source import whose view it caches.
-		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
-			std::collections::HashMap::new();
+		// Color converter will be initialized on first frame.
+		let mut color_converter: Option<ColorConverter> = None;
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
 
-		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
-		let mut dmabuf_importer: Option<DmaBufImporter> = None;
+		// The encoder runs with an infinite GOP (see `with_gop_size(0)`), so it
+		// never emits a periodic keyframe on its own — keyframes only happen when
+		// we explicitly request one. That is fragile: if the client never sends a
+		// reference-frame-invalidation (some Moonlight builds don't, or the report
+		// is lost), a decoder that falls out of sync has no way to resync and stays
+		// black. A periodic IDR guarantees a fresh keyframe every few seconds, giving
+		// the stream a resync point independent of client behaviour.
+		// Desktop sessions stretch the backstop: a high-bitrate keyframe is a
+		// burst of UDP packets that on lossy links (WiFi) itself causes loss
+		// → client RFI → another keyframe. Games keep the short period.
+		let idr_period = if ctx.desktop_mode {
+			std::time::Duration::from_secs(10)
+		} else {
+			std::time::Duration::from_secs(2)
+		};
+		let mut last_idr_time = std::time::Instant::now();
+
+		let mut desktop_handler: Option<DesktopFrameHandler> = None;
 
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
+
+		let mut invalidation_coalescer = ctx.desktop_mode.then(InvalidationCoalescer::new);
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
@@ -719,6 +747,17 @@ impl VideoPipelineInner {
 		while !stop_session_manager.is_shutdown_triggered() {
 			let mut pending_idr = false;
 
+			// Periodic keyframe: the infinite-GOP encoder only emits an IDR when we
+			// ask, so schedule one every `idr_period` to guarantee the client always
+			// has a resync point. Gated on `has_encoded` so we don't request an IDR
+			// before the first real frame is in flight.
+			if has_encoded && last_idr_time.elapsed() >= idr_period {
+				tracing::debug!("Periodic IDR requested (infinite-GOP safety net)");
+				encoder.request_idr();
+				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
+			}
+
 			// Drain any pending stream-reset requests (client reconnect/resume).
 			//
 			// Moonlight starts every (re)connected session with its frame counter at 1
@@ -746,6 +785,7 @@ impl VideoPipelineInner {
 				frame_number_base = submitted_count;
 				encoder.request_idr();
 				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
 			}
 
 			// Drain any pending IDR requests.
@@ -755,37 +795,58 @@ impl VideoPipelineInner {
 						tracing::debug!("IDR frame requested");
 						encoder.request_idr();
 						pending_idr = true;
+						last_idr_time = std::time::Instant::now();
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						tracing::debug!("IDR frame channel lagged by {n} messages.");
 						encoder.request_idr();
 						pending_idr = true;
+						last_idr_time = std::time::Instant::now();
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
 			}
 
-			// Drain any pending reference-frame-invalidation requests. Each takes
-			// effect on the next submitted frame, which then predicts from a
-			// surviving reference instead of forcing an IDR (the encoder still
-			// falls back to an IDR when no reference survives).
+			// Drain any pending reference-frame-invalidation requests. The client
+			// reports it lost a run of frames and can no longer decode — so it needs
+			// a fresh keyframe to resync, full stop. We drop the tainted references
+			// from the encoder's DPB *and* force an IDR on the next frame. Relying on
+			// pixelforge's "predict from a surviving reference" heuristic (which only
+			// falls back to an IDR when *no* reference survives) leaves a fully
+			// desynced client black: it still gets P-frames referencing pictures it
+			// never had, and keeps re-requesting invalidation forever.
+			let mut invalidation_first: Option<u64> = None;
+			let mut saw_invalidation = false;
 			loop {
 				match invalidate_request_rx.try_recv() {
 					Ok((first, _last)) => {
 						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
 						tracing::debug!(
-							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
+							"Reference frame invalidation requested from client frame {first} (display order {first_display_order}); forcing IDR"
 						);
-						encoder.invalidate_reference_frames(first_display_order);
+						saw_invalidation = true;
+						invalidation_first =
+							Some(invalidation_first.map_or(first_display_order, |e: u64| e.min(first_display_order)));
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
 						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
-						encoder.request_idr();
-						pending_idr = true;
+						saw_invalidation = true;
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
+			}
+			if saw_invalidation
+				&& invalidation_coalescer
+					.as_mut()
+					.is_none_or(|c| c.should_honor(invalidation_first))
+			{
+				if let Some(first_display_order) = invalidation_first {
+					encoder.invalidate_reference_frames(first_display_order);
+				}
+				encoder.request_idr();
+				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
 			}
 
 			// Try to receive a frame from compositor (with timeout).
@@ -842,7 +903,7 @@ impl VideoPipelineInner {
 				// keeps the encoded P-frame chain valid (a skipped frame never enters
 				// the encoder's reference state). The IDR re-encode path is never
 				// gated — the client needs that keyframe.
-				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
+				if in_flight.load(Ordering::Relaxed) >= max_in_flight {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
 							"Video encode backpressure: packet consumer is behind; dropping captured \
@@ -865,71 +926,46 @@ impl VideoPipelineInner {
 					frame.planes.len()
 				);
 
-				let importer = match &mut dmabuf_importer {
-					Some(imp) => imp,
-					None => match DmaBufImporter::new(context.clone()) {
-						Ok(imp) => {
-							dmabuf_importer = Some(imp);
-							dmabuf_importer.as_mut().unwrap()
-						},
-						Err(e) => {
-							tracing::warn!("Failed to create DMA-BUF importer: {e}");
-							frame.consumed.store(true, Ordering::Release);
-							continue;
-						},
+				let handler = match &mut desktop_handler {
+					Some(h) => h,
+					None => {
+						desktop_handler = Some(DesktopFrameHandler::new(context.clone(), ctx.width, ctx.height));
+						desktop_handler.as_mut().unwrap()
 					},
 				};
-
-				// Build DmaBufPlane array from ExportedFrame planes.
-				let mut planes_buf = [DmaBufPlane {
-					fd: 0,
-					offset: 0,
-					stride: 0,
-					modifier: 0,
-				}; 4];
-				let plane_count = frame.planes.len().min(4);
-				for (i, p) in frame.planes.iter().take(4).enumerate() {
-					planes_buf[i] = DmaBufPlane {
-						fd: p.fd,
-						offset: p.offset,
-						stride: p.stride,
-						modifier: frame.modifier,
-					};
-				}
-				let planes = &planes_buf[..plane_count];
-
-				// Determine Vulkan format and input format from the frame's DRM fourcc.
-				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
-
-				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-				// The `Arc` pins the image while the converter caches a view of it.
-				let (source_import, needs_transition) =
-					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}");
-							frame.consumed.store(true, Ordering::Release);
-							continue;
-						},
-					};
-				let source_image = source_import.image();
-
-				// First-time imports are in UNDEFINED layout; the converter
-				// will handle the transition inside its command buffer.
-				// Cached imports were left in GENERAL by the previous convert.
-				let src_layout = if needs_transition {
-					vk::ImageLayout::UNDEFINED
-				} else {
-					vk::ImageLayout::GENERAL
+				let (frame_result, _) = handler.handle_frame(&frame, frame.format);
+				let (source_image, src_layout, frame_input_format) = match frame_result {
+					DesktopFrameResult::Ready {
+						source_image,
+						src_layout,
+						input_format,
+					} => (source_image, src_layout, input_format),
+					DesktopFrameResult::Dropped => {
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					},
+					DesktopFrameResult::Fatal(e) => return Err(e),
 				};
-
 				let t2_imported = std::time::Instant::now();
 
-				// Get (or build) a converter for this input format. Cached per
-				// format so switching render paths doesn't rebuild one each frame.
-				let (converter, cached_source) = match color_converters.entry(frame.format) {
-					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-					std::collections::hash_map::Entry::Vacant(e) => {
+				// Recreate the converter if the input format changed (e.g. GBM pool
+				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
+				// format must match the source image format.
+				if let Some(ref conv) = color_converter
+					&& conv.config().input_format != frame_input_format
+				{
+					tracing::info!(
+						"Input format changed from {:?} to {:?}, recreating color converter",
+						conv.config().input_format,
+						frame_input_format,
+					);
+					color_converter = None;
+				}
+
+				// Initialize converter if needed.
+				let converter = match &mut color_converter {
+					Some(conv) => conv,
+					None => {
 						let (color_space, full_range) = match ctx.dynamic_range {
 							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
@@ -940,8 +976,8 @@ impl VideoPipelineInner {
 						config.full_range = full_range;
 						match ColorConverter::new(context.clone(), config) {
 							Ok(conv) => {
-								tracing::debug!("Created color converter for input format {frame_input_format:?}");
-								e.insert((conv, None))
+								color_converter = Some(conv);
+								color_converter.as_mut().unwrap()
 							},
 							Err(e) => {
 								tracing::warn!("Failed to create color converter: {e}");
@@ -1004,10 +1040,12 @@ impl VideoPipelineInner {
 					}
 				}
 
-				// Retain the source image; the converter caches a view of it.
-				*cached_source = Some(Arc::clone(&source_import));
-
 				// Convert to YUV.
+				tracing::debug!(
+					"GPU color conversion: source_image={:?}, src_layout={:?}",
+					source_image,
+					src_layout
+				);
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
 					frame.consumed.store(true, Ordering::Release);
 					if is_device_lost(&e) {
@@ -1053,7 +1091,11 @@ impl VideoPipelineInner {
 				// Encode the converted image. This is asynchronous: it submits the
 				// frame without blocking; the encoded packet is produced by the
 				// readback thread and handled by the consumer thread.
+				tracing::debug!("Encoding frame");
 				let encode_result = encoder.encode(encoder.input_image());
+				if encode_result.is_err() {
+					tracing::warn!("Encoding failed");
+				}
 
 				let t4_encoded = std::time::Instant::now();
 
@@ -1077,12 +1119,19 @@ impl VideoPipelineInner {
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
-						if frame_ctx_tx
-							.blocking_send(ConsumerMessage::Frame(frame_context, future))
-							.is_err()
-						{
-							tracing::debug!("Packet consumer gone; stopping encoding loop.");
-							break;
+						match frame_ctx_tx.try_send(ConsumerMessage::Frame(frame_context, future)) {
+							Ok(()) => {},
+							Err(mpsc::error::TrySendError::Full(_)) => {
+								in_flight.fetch_sub(1, Ordering::Relaxed);
+								submitted_count -= 1;
+								tracing::debug!("Packet consumer backed up; dropping encoded frame and forcing IDR.");
+								encoder.request_idr();
+							},
+							Err(mpsc::error::TrySendError::Closed(_)) => {
+								in_flight.fetch_sub(1, Ordering::Relaxed);
+								tracing::debug!("Packet consumer gone; stopping encoding loop.");
+								break;
+							},
 						}
 					},
 					Err(e) => {

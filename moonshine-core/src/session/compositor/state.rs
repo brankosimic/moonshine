@@ -49,6 +49,7 @@ use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
@@ -268,6 +269,9 @@ pub(crate) struct MoonshineCompositor {
 	pub buffer_last_rendered_at: [Option<usize>; BUFFER_POOL_SIZE],
 	/// Monotonically increasing render counter.
 	pub render_count: usize,
+
+	// -- Single-pixel buffer --
+	pub single_pixel_buffer_state: SinglePixelBufferState,
 
 	// -- Static screen detection --
 	/// Set to `true` whenever visible content changes (surface commit, cursor
@@ -513,6 +517,7 @@ impl MoonshineCompositor {
 		PointerConstraintsState::new::<Self>(&display_handle);
 		TabletManagerState::new::<Self>(&display_handle);
 		let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
+		let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
@@ -681,6 +686,7 @@ impl MoonshineCompositor {
 				overlay_raised: false,
 				overlay_z_x11_window: None,
 				viewporter_state,
+				single_pixel_buffer_state,
 				color_management,
 				deferred_info_done: Vec::new(),
 				xwayland_shell_state,
@@ -1509,6 +1515,8 @@ impl MoonshineCompositor {
 					fd: handle.as_raw_fd(),
 					offset,
 					stride,
+					mapped_ptr: None,
+					mapped_size: 0,
 				},
 			)
 			.collect();
@@ -1673,6 +1681,8 @@ impl MoonshineCompositor {
 					fd: handle.as_raw_fd(),
 					offset,
 					stride,
+					mapped_ptr: None,
+					mapped_size: 0,
 				},
 			)
 			.collect();
@@ -1689,7 +1699,6 @@ impl MoonshineCompositor {
 			color_space,
 			hdr_metadata,
 		};
-
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
 		match self.frame_tx.try_send(exported_frame) {
@@ -2145,6 +2154,8 @@ fn export_dmabuf(
 			fd: handle.as_raw_fd(),
 			offset,
 			stride,
+			mapped_ptr: None,
+			mapped_size: 0,
 		})
 		.collect();
 

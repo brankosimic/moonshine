@@ -127,6 +127,10 @@ pub(crate) struct ExportedFrame {
 	pub hdr_metadata: Option<HdrMetadata>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MappedPtr(pub *const u8);
+unsafe impl Send for MappedPtr {}
+
 /// Metadata for a single DMA-BUF plane.
 ///
 /// The fd is a borrowed reference (raw fd number) into the compositor's
@@ -139,4 +143,10 @@ pub(crate) struct ExportedPlane {
 	pub offset: u32,
 	/// Row stride in bytes.
 	pub stride: u32,
+	/// For software (memfd/memptr) buffers: a valid mmap of the data.
+	/// `None` for DMA-BUF buffers.
+	pub mapped_ptr: Option<MappedPtr>,
+	/// Size in bytes of the mapped region (only meaningful when
+	/// `mapped_ptr` is `Some`).
+	pub mapped_size: usize,
 }

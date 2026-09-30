@@ -184,6 +184,31 @@ fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_preb
 	l
 }
 
+/// Channel map matching the encoder's layout for the negotiated channel count.
+pub(crate) fn capture_channel_map(channels: u8) -> pulse::ChannelMap {
+	match channels {
+		6 => pulse::ChannelMap::new([
+			pulse::ChannelPosition::FrontLeft,
+			pulse::ChannelPosition::FrontRight,
+			pulse::ChannelPosition::FrontCenter,
+			pulse::ChannelPosition::Lfe,
+			pulse::ChannelPosition::RearLeft,
+			pulse::ChannelPosition::RearRight,
+		]),
+		8 => pulse::ChannelMap::new([
+			pulse::ChannelPosition::FrontLeft,
+			pulse::ChannelPosition::FrontRight,
+			pulse::ChannelPosition::FrontCenter,
+			pulse::ChannelPosition::Lfe,
+			pulse::ChannelPosition::RearLeft,
+			pulse::ChannelPosition::RearRight,
+			pulse::ChannelPosition::SideLeft,
+			pulse::ChannelPosition::SideRight,
+		]),
+		_ => pulse::ChannelMap::stereo(),
+	}
+}
+
 impl PulseServer {
 	pub fn spawn(
 		listener: std::os::unix::net::UnixListener,
@@ -223,27 +248,7 @@ impl PulseServer {
 			sample_rate: CAPTURE_SAMPLE_RATE,
 		};
 
-		let channel_map = match channels {
-			6 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-			]),
-			8 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-				pulse::ChannelPosition::SideLeft,
-				pulse::ChannelPosition::SideRight,
-			]),
-			_ => pulse::ChannelMap::stereo(),
-		};
+		let channel_map = capture_channel_map(channels);
 
 		let port_name = match channels {
 			6 => "Surround 5.1 Output",
