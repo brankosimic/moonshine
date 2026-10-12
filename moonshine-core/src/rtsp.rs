@@ -493,16 +493,6 @@ impl RtspServer {
 	}
 
 	async fn handle_connection(&self, mut connection: TcpStream, address: SocketAddr) -> Result<(), ()> {
-		// Gate RTSP access: only process requests when a session has been initialized
-		// via the authenticated /launch or /resume endpoint (H-3 mitigation).
-		match self.session_manager.get_session_context().await {
-			Ok(Some(_)) => {},
-			_ => {
-				tracing::warn!("Rejected RTSP connection from {}: no active session", address);
-				return Ok(());
-			},
-		}
-
 		let mut message_buffer = String::new();
 
 		let message = loop {
@@ -554,11 +544,28 @@ impl RtspServer {
 					.map_err(|e| tracing::warn!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
-					Method::Announce => self.handle_announce_request(request, cseq).await,
+					Method::Announce | Method::Setup | Method::Play => {
+						match self.session_manager.get_session_context().await {
+							Ok(Some(_)) => {},
+							_ => {
+								tracing::warn!(
+									"Rejected RTSP {:?} request from {}: no active session",
+									request.method(),
+									address
+								);
+								return Ok(());
+							},
+						}
+
+						match request.method() {
+							Method::Announce => self.handle_announce_request(request, cseq).await,
+							Method::Setup => self.handle_setup_request(request, cseq),
+							Method::Play => self.handle_play_request(request, cseq).await,
+							_ => unreachable!(),
+						}
+					},
 					Method::Describe => self.handle_describe_request(request, cseq).await,
 					Method::Options => self.handle_options_request(request, cseq),
-					Method::Setup => self.handle_setup_request(request, cseq),
-					Method::Play => self.handle_play_request(request, cseq).await,
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);
 						rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
