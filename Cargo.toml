@@ -8,6 +8,10 @@ resolver = "2"
 # texelFetch return only the R channel (G/B/A read as zero) -> green-screen
 # stream. The fork switches the converter to a plain descriptor set, which
 # samples correctly. Keep this until the fix is upstreamed and a new tag cut.
+#
+# The sources are not vendored here: run dist/prepare-pixelforge.sh to clone the
+# tag and apply patches/pixelforge.patch into .pixelforge-patch/ (gitignored)
+# before building on a fresh checkout.
 [patch."https://github.com/hgaiser/pixelforge"]
 pixelforge = { path = ".pixelforge-patch" }
 

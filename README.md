@@ -136,8 +136,11 @@ sudo pacman -S \
 Then build:
 
 ```sh
+./dist/prepare-pixelforge.sh   # only needed once per checkout
 cargo build --release --workspace
 ```
+
+`prepare-pixelforge.sh` clones pixelforge `v0.9.1` and applies `patches/pixelforge.patch` into `.pixelforge-patch/`, which Cargo's `[patch]` table redirects the dependency to. The patch fixes the color converter on RADV/AMD (upstream fills `COMBINED_IMAGE_SAMPLER` descriptors through `VK_EXT_descriptor_buffer`, which makes `texelFetch` return only the R channel and produces a green-screen stream).
 
 Set up the environment:
 
