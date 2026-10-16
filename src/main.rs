@@ -243,6 +243,7 @@ impl Moonshine {
 				config.stream.port,
 				config.webserver.clone(),
 				config.applications.clone(),
+				config.stream.desktop,
 				supported_codecs,
 				hdr_supported,
 				client_manager.persistent_state().get_uuid()?.to_string(),

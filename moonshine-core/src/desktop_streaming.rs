@@ -38,13 +38,22 @@ fn environment_suggests_kde() -> bool {
 	if !desktop.is_empty() {
 		return desktop.to_lowercase().contains("kde");
 	}
-	// systemd-user service: no desktop vars set. Fall back to looking for
-	// Plasma's runtime sockets in XDG_RUNTIME_DIR (kwin-wayland creates the
-	// `kwin_wayland` socket in every Plasma Wayland session).
 	let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
 		return false;
 	};
-	runtime_dir.join("kwin_wayland").exists()
+	runtime_dir.join("kwin_wayland").exists() || has_wayland_socket(&runtime_dir)
+}
+
+fn has_wayland_socket(runtime_dir: &std::path::Path) -> bool {
+	let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+		return false;
+	};
+	entries.flatten().any(|entry| {
+		entry
+			.file_name()
+			.to_str()
+			.is_some_and(|name| name.starts_with("wayland-") && !name.ends_with(".lock"))
+	})
 }
 
 /// Whether the Plasma session is reachable on the session bus and the portal
@@ -96,6 +105,20 @@ pub fn detect_desktop_session() -> bool {
 		return false;
 	};
 	runtime.block_on(probe())
+}
+
+pub async fn desktop_exposed(mode: DesktopMode) -> bool {
+	let captured = || async {
+		matches!(
+			tokio::time::timeout(Duration::from_secs(2), desktop_capture_supported()).await,
+			Ok(Some(true))
+		)
+	};
+	match mode {
+		DesktopMode::On => captured().await,
+		DesktopMode::Auto => environment_suggests_kde() && captured().await,
+		DesktopMode::Off => false,
+	}
 }
 
 fn desktop_boxart_path() -> Option<std::path::PathBuf> {
@@ -238,6 +261,11 @@ mod tests {
 			},
 			..Default::default()
 		}
+	}
+
+	#[tokio::test]
+	async fn desktop_exposed_off_mode_is_always_false() {
+		assert!(!desktop_exposed(DesktopMode::Off).await);
 	}
 
 	#[test]
