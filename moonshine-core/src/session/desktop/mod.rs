@@ -420,19 +420,7 @@ fn run_capture_inner(
 		})
 		.process(move |stream, shared| {
 			let mut shared = shared.borrow_mut();
-			shared.pending.retain_mut(|frame| {
-				if frame.consumed.load(Ordering::Acquire) {
-					if let Some((ptr, size)) = frame.unmap.take() {
-						unsafe {
-							libc::munmap(ptr, size);
-						}
-					}
-					unsafe { stream.queue_raw_buffer(frame.buf) };
-					false
-				} else {
-					true
-				}
-			});
+			drain_consumed(stream, &mut shared.pending);
 			let Some(info) = shared.info.as_ref() else {
 				return;
 			};
@@ -442,6 +430,7 @@ fn run_capture_inner(
 				return;
 			};
 			let min_interval = Duration::from_secs_f64(0.95 / (refresh_rate.max(1) as f64));
+			let mut latest: Option<(ExportedFrame, PendingFrame)> = None;
 			loop {
 				let buf = unsafe { stream.dequeue_raw_buffer() };
 				if buf.is_null() {
@@ -483,17 +472,28 @@ fn run_capture_inner(
 					hdr_metadata: None,
 				};
 				shared.next_index = shared.next_index.wrapping_add(1);
+				if let Some((old_frame, mut old_pending)) = latest.take() {
+					old_frame.mark_consumed();
+					if let Some((ptr, size)) = old_pending.unmap.take() {
+						unsafe { libc::munmap(ptr, size) };
+					}
+					unsafe { stream.queue_raw_buffer(old_pending.buf) };
+				}
+				latest = Some((frame, PendingFrame { buf, consumed, unmap }));
+			}
+			if let Some((frame, pending)) = latest {
 				match shared.frame_tx.try_send(frame) {
 					Ok(()) => {
 						shared.last_handoff = Some(Instant::now());
-						shared.pending.push(PendingFrame { buf, consumed, unmap });
+						shared.pending.push(pending);
 						write_eventfd(wake_raw);
 					},
 					Err(_) => {
-						if let Some((ptr, size)) = unmap {
+						drain_consumed(stream, &mut shared.pending);
+						if let Some((ptr, size)) = pending.unmap {
 							unsafe { libc::munmap(ptr, size) };
 						}
-						unsafe { stream.queue_raw_buffer(buf) };
+						unsafe { stream.queue_raw_buffer(pending.buf) };
 					},
 				}
 			}
@@ -580,6 +580,21 @@ fn drain_eventfd(fd: RawFd) {
 	unsafe {
 		let _ = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
 	}
+}
+fn drain_consumed(stream: &pw::stream::Stream, pending: &mut Vec<PendingFrame>) {
+	pending.retain_mut(|frame| {
+		if frame.consumed.load(Ordering::Acquire) {
+			if let Some((ptr, size)) = frame.unmap.take() {
+				unsafe {
+					libc::munmap(ptr, size);
+				}
+			}
+			unsafe { stream.queue_raw_buffer(frame.buf) };
+			false
+		} else {
+			true
+		}
+	});
 }
 fn captured_format(info: &spa::param::video::VideoInfoRaw) -> Option<(u32, u32, u32)> {
 	use spa::param::video::VideoFormat;

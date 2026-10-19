@@ -1227,6 +1227,7 @@ impl VideoPipelineInner {
 		};
 
 		let mut last_drop_warn: Option<std::time::Instant> = None;
+		let mut last_stale_warn: Option<std::time::Instant> = None;
 
 		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
 			(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => OutputFormat::NV12,
@@ -1378,7 +1379,7 @@ impl VideoPipelineInner {
 				},
 			};
 
-			if let Some(frame) = received_frame {
+			if let Some(mut frame) = received_frame {
 				if in_flight.load(Ordering::Relaxed) >= max_in_flight {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
@@ -1389,6 +1390,24 @@ impl VideoPipelineInner {
 					}
 					frame.mark_consumed();
 					continue;
+				}
+
+				let staleness_budget = frame_interval * 2;
+				while std::time::Instant::now().duration_since(frame.created_at) > staleness_budget {
+					match frame_rx.try_recv() {
+						Ok(fresh) => {
+							if last_stale_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+								tracing::warn!(
+									"Desktop frame {} ms old; skipping to newest to stay realtime.",
+									std::time::Instant::now().duration_since(frame.created_at).as_millis()
+								);
+								last_stale_warn = Some(std::time::Instant::now());
+							}
+							frame.mark_consumed();
+							frame = fresh;
+						},
+						Err(_) => break,
+					}
 				}
 
 				let t1_received = std::time::Instant::now();
@@ -1412,18 +1431,22 @@ impl VideoPipelineInner {
 					},
 				};
 				let (frame_result, _) = handler.handle_frame(&frame, fourcc);
-				let (source_image, src_layout, frame_input_format) = match frame_result {
+				let (source_image, src_layout, frame_input_format, buffer_released) = match frame_result {
 					DesktopFrameResult::Ready {
 						source_image,
 						src_layout,
 						input_format,
-					} => (source_image, src_layout, input_format),
+						buffer_released,
+					} => (source_image, src_layout, input_format, buffer_released),
 					DesktopFrameResult::Dropped => {
 						frame.mark_consumed();
 						continue;
 					},
 					DesktopFrameResult::Fatal(e) => return Err(e),
 				};
+				if buffer_released {
+					frame.mark_consumed();
+				}
 				let t2_imported = std::time::Instant::now();
 
 				let (converter, cached_source) = match color_converters.entry(fourcc) {
