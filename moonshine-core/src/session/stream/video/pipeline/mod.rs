@@ -5,6 +5,7 @@
 
 mod desktop_frame;
 mod dmabuf;
+mod dmabuf_diag;
 mod fence;
 mod gpu_copy;
 mod gpu_scaler;

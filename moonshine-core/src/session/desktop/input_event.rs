@@ -1,9 +1,3 @@
-//! A decoded Moonlight input event in desktop (portal) terms.
-//!
-//! The control stream decodes Moonlight's wire format once and hands the result
-//! to whichever sink owns the session: a game forwards it to ferriscope's seat,
-//! while a desktop forwards it to the XDG portal's RemoteDesktop interface.
-
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum DesktopInputEvent {

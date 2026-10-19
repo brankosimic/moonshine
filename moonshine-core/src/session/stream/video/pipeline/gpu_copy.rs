@@ -1,12 +1,4 @@
-//! Fallback helpers for DMA-BUF frames the driver cannot import as external memory.
-//!
-//! Some drivers (e.g. NVIDIA at certain large resolutions) report no usable memory
-//! type for a portal buffer's DMA-BUF fd, so zero-copy `vkImportMemoryFd` fails.
-
 use std::os::fd::RawFd;
-
-/// Map a DMA-BUF plane fd read-only so the caller can feed it to the CPU uploader.
-/// Returns `(ptr, size)` on success.
 pub(crate) fn map_dmabuf_plane(fd: RawFd, offset: u32, stride: u32, height: u32) -> Option<(*const u8, usize)> {
 	if fd < 0 {
 		return None;

@@ -1,6 +1,5 @@
 use ash::vk;
 use pixelforge::VideoContext;
-
 fn spirv_words(bytes: &[u8]) -> Vec<u32> {
 	bytes
 		.as_chunks::<4>()
@@ -9,10 +8,7 @@ fn spirv_words(bytes: &[u8]) -> Vec<u32> {
 		.map(|c| u32::from_le_bytes(*c))
 		.collect()
 }
-
 const SCALER_SPIRV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scaler.spv"));
-
-/// A Vulkan image plus its bound memory.
 struct GpuImage {
 	image: vk::Image,
 	view: vk::ImageView,
@@ -20,22 +16,13 @@ struct GpuImage {
 	width: u32,
 	height: u32,
 	format: vk::Format,
-	/// Cleared after the first submit that transitions the image, so reused
-	/// frames take a `GENERAL -> ...` barrier instead of an invalid
-	/// `UNDEFINED -> ...` one.
 	fresh: bool,
 }
-
-/// Reusable host-visible staging buffer, grown on demand and reused across
-/// frames to avoid per-frame `vkCreateBuffer` +
-/// `vkAllocateMemory` + `vkFreeMemory` churn in the encode hot path.
-/// Grown (never shrunk) when a larger frame arrives.
 struct StagingBuffer {
 	buffer: vk::Buffer,
 	memory: vk::DeviceMemory,
 	size: vk::DeviceSize,
 }
-
 fn create_image(
 	context: &VideoContext,
 	width: u32,
@@ -44,7 +31,6 @@ fn create_image(
 	format: vk::Format,
 ) -> Result<GpuImage, String> {
 	let device = context.device();
-
 	let image_info = vk::ImageCreateInfo::default()
 		.image_type(vk::ImageType::TYPE_2D)
 		.format(format)
@@ -61,7 +47,6 @@ fn create_image(
 		.sharing_mode(vk::SharingMode::EXCLUSIVE)
 		.initial_layout(vk::ImageLayout::UNDEFINED);
 	let image = unsafe { device.create_image(&image_info, None) }.map_err(|e| format!("scaler image: {e}"))?;
-
 	let mem_reqs = unsafe { device.get_image_memory_requirements(image) };
 	let mem_type = context
 		.find_memory_type(mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
@@ -84,7 +69,6 @@ fn create_image(
 		};
 		return Err(format!("scaler image bind: {e}"));
 	}
-
 	let view_info = vk::ImageViewCreateInfo::default()
 		.image(image)
 		.view_type(vk::ImageViewType::TYPE_2D)
@@ -103,7 +87,6 @@ fn create_image(
 		}
 		format!("scaler image view: {e}")
 	})?;
-
 	Ok(GpuImage {
 		image,
 		view,
@@ -114,7 +97,6 @@ fn create_image(
 		fresh: true,
 	})
 }
-
 fn destroy_image(context: &VideoContext, img: GpuImage) {
 	let device = context.device();
 	unsafe {
@@ -123,9 +105,6 @@ fn destroy_image(context: &VideoContext, img: GpuImage) {
 		device.free_memory(img.memory, None);
 	}
 }
-
-/// GPU compute-shader scaler. Uploads a packed RGBA source to a sampled image and
-/// runs a bilinear-filtered scale into a device-local target image in one submit.
 pub(crate) struct GpuScaler {
 	context: VideoContext,
 	src_image: Option<GpuImage>,
@@ -143,15 +122,7 @@ pub(crate) struct GpuScaler {
 	dumped: std::sync::atomic::AtomicBool,
 	dumped_dst: std::sync::atomic::AtomicBool,
 }
-
-// Push-constant layout must match the shader's `Params` block (10 u32 words).
 const PUSH_SIZE: u32 = 40;
-
-/// Build push constants for an aspect-preserving fit of `src` into `dst`.
-///
-/// Returns `[src_w, src_h, dst_w, dst_h, inv_out_w, inv_out_h, off_x, off_y,
-/// out_w, out_h]`. The fitted rect is centered; the shader paints the area
-/// outside it black (letterbox) instead of stretching the image.
 fn letterbox_push(src_w: u32, src_h: u32, target_w: u32, target_h: u32) -> [u32; 10] {
 	let scale = ((target_w as f32) / (src_w.max(1) as f32)).min((target_h as f32) / (src_h.max(1) as f32));
 	let out_w = (((src_w as f32) * scale).round() as u32).clamp(1, target_w.max(1));
@@ -171,7 +142,6 @@ fn letterbox_push(src_w: u32, src_h: u32, target_w: u32, target_h: u32) -> [u32;
 		out_h,
 	]
 }
-
 fn full_range() -> vk::ImageSubresourceRange {
 	vk::ImageSubresourceRange {
 		aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -181,11 +151,9 @@ fn full_range() -> vk::ImageSubresourceRange {
 		layer_count: 1,
 	}
 }
-
 impl GpuScaler {
 	pub fn new(context: VideoContext) -> Result<Self, String> {
 		let device = context.device();
-
 		let command_pool = unsafe {
 			device.create_command_pool(
 				&vk::CommandPoolCreateInfo::default()
@@ -195,7 +163,6 @@ impl GpuScaler {
 			)
 		}
 		.map_err(|e| format!("scaler command pool: {e}"))?;
-
 		let command_buffer = unsafe {
 			device.allocate_command_buffers(
 				&vk::CommandBufferAllocateInfo::default()
@@ -205,7 +172,6 @@ impl GpuScaler {
 			)
 		}
 		.map_err(|e| format!("scaler command buffer alloc: {e}"))?[0];
-
 		let fence = unsafe {
 			device.create_fence(
 				&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -213,7 +179,6 @@ impl GpuScaler {
 			)
 		}
 		.map_err(|e| format!("scaler fence: {e}"))?;
-
 		let sampler_info = vk::SamplerCreateInfo::default()
 			.mag_filter(vk::Filter::LINEAR)
 			.min_filter(vk::Filter::LINEAR)
@@ -226,7 +191,6 @@ impl GpuScaler {
 			.max_anisotropy(1.0);
 		let sampler =
 			unsafe { device.create_sampler(&sampler_info, None) }.map_err(|e| format!("scaler sampler: {e}"))?;
-
 		let bindings = [
 			vk::DescriptorSetLayoutBinding::default()
 				.binding(0)
@@ -243,7 +207,6 @@ impl GpuScaler {
 			device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
 		}
 		.map_err(|e| format!("scaler dsl: {e}"))?;
-
 		let push_range = vk::PushConstantRange::default()
 			.stage_flags(vk::ShaderStageFlags::COMPUTE)
 			.offset(0)
@@ -257,7 +220,6 @@ impl GpuScaler {
 			)
 		}
 		.map_err(|e| format!("scaler pipeline layout: {e}"))?;
-
 		let spirv_words = spirv_words(SCALER_SPIRV_BYTES);
 		let shader_info = vk::ShaderModuleCreateInfo::default().code(&spirv_words);
 		let shader_module = unsafe { device.create_shader_module(&shader_info, None) }
@@ -273,7 +235,6 @@ impl GpuScaler {
 		let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) }
 			.map_err(|(_, e)| format!("scaler compute pipeline: {e:?}"))?[0];
 		unsafe { device.destroy_shader_module(shader_module, None) };
-
 		let descriptor_pool = unsafe {
 			device.create_descriptor_pool(
 				&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
@@ -288,7 +249,6 @@ impl GpuScaler {
 			)
 		}
 		.map_err(|e| format!("scaler descriptor pool: {e}"))?;
-
 		Ok(Self {
 			context,
 			src_image: None,
@@ -307,7 +267,6 @@ impl GpuScaler {
 			dumped_dst: std::sync::atomic::AtomicBool::new(false),
 		})
 	}
-
 	fn ensure_src(&mut self, width: u32, height: u32, format: vk::Format) -> Result<&GpuImage, String> {
 		let needs = self
 			.src_image
@@ -327,7 +286,6 @@ impl GpuScaler {
 		}
 		Ok(self.src_image.as_ref().expect("src just created"))
 	}
-
 	fn ensure_dst(&mut self, width: u32, height: u32) -> Result<&GpuImage, String> {
 		let needs = self
 			.dst_image
@@ -347,9 +305,6 @@ impl GpuScaler {
 		}
 		Ok(self.dst_image.as_ref().expect("dst just created"))
 	}
-
-	/// Return a host-visible staging buffer of at least `size` bytes, reusing
-	/// (or growing) the cached one instead of allocating per frame.
 	fn ensure_staging(&mut self, size: vk::DeviceSize) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
 		let device = self.context.device();
 		let needs = self.staging.as_ref().is_none_or(|s| s.size < size);
@@ -401,7 +356,6 @@ impl GpuScaler {
 		let s = self.staging.as_ref().expect("staging just created");
 		Ok((s.buffer, s.memory))
 	}
-
 	fn wait_previous_submit(&mut self) -> Result<(), String> {
 		let device = self.context.device();
 		let status = unsafe { device.get_fence_status(self.fence) };
@@ -419,7 +373,6 @@ impl GpuScaler {
 		}
 		Ok(())
 	}
-
 	#[allow(clippy::too_many_arguments)]
 	fn fill_staging(
 		&mut self,
@@ -436,14 +389,12 @@ impl GpuScaler {
 		let device = self.context.device();
 		let mapped = unsafe { device.map_memory(upload_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
 			.map_err(|e| format!("scaler map upload: {e}"))? as *mut u8;
-
 		let row_pitch = src_w as usize * bpp;
 		let stride_usize = stride as usize;
 		let valid_rows = (src_size / stride_usize.max(1))
 			.min(src_h as usize)
 			.max(if src_size > 0 { 1 } else { 0 });
 		if swap_rb && bpp == 4 {
-			// BGRx -> RGBA swizzle while copying.
 			for y in 0..valid_rows {
 				let srow = unsafe { src.add(y * stride_usize) };
 				let drow = unsafe { mapped.add(y * row_pitch) };
@@ -452,10 +403,10 @@ impl GpuScaler {
 					let s = unsafe { srow.add(x * 4) };
 					let d = unsafe { drow.add(x * 4) };
 					unsafe {
-						*d.add(0) = *s.add(2); // R <- B
-						*d.add(1) = *s.add(1); // G <- G
-						*d.add(2) = *s.add(0); // B <- R
-						*d.add(3) = *s.add(3); // A <- X
+						*d.add(0) = *s.add(2);
+						*d.add(1) = *s.add(1);
+						*d.add(2) = *s.add(0);
+						*d.add(3) = *s.add(3);
 					}
 				}
 			}
@@ -474,18 +425,13 @@ impl GpuScaler {
 				unsafe { std::ptr::copy_nonoverlapping(srow, drow, len) };
 			}
 		}
-		// One-shot diagnostic (MOONSHINE_SCALE_DUMP): dumps the staged pixels
-		// to /tmp/moonshine_src_debug.png so a black capture is distinguishable
-		// from a broken upload.
 		if std::env::var("MOONSHINE_SCALE_DUMP").is_ok() && !self.dumped.swap(true, std::sync::atomic::Ordering::SeqCst)
 		{
 			dump_rgba_to_png(mapped, src_w, src_h, row_pitch as u32, "/tmp/moonshine_src_debug.png");
 		}
 		unsafe { device.unmap_memory(upload_mem) };
-
 		Ok((upload_staging, row_pitch as u32))
 	}
-
 	#[allow(clippy::too_many_arguments)]
 	pub fn upload(
 		&mut self,
@@ -498,17 +444,14 @@ impl GpuScaler {
 		src_size: usize,
 	) -> Result<vk::Image, String> {
 		self.wait_previous_submit()?;
-
 		let (image, fresh) = {
 			let s = self.ensure_src(src_w, src_h, format)?;
 			(s.image, s.fresh)
 		};
 		let (staging, _row_pitch) = self.fill_staging(src, src_w, src_h, stride, bpp, false, src_size)?;
-
 		let device = self.context.device();
 		let fence = self.fence;
 		let command_buffer = self.command_buffer;
-
 		let barrier_in = vk::ImageMemoryBarrier::default()
 			.old_layout(if fresh {
 				vk::ImageLayout::UNDEFINED
@@ -526,7 +469,6 @@ impl GpuScaler {
 				vk::AccessFlags::SHADER_READ
 			})
 			.dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
 		let copy = vk::BufferImageCopy::default()
 			.buffer_offset(0)
 			.buffer_row_length(src_w)
@@ -543,7 +485,6 @@ impl GpuScaler {
 				height: src_h,
 				depth: 1,
 			});
-
 		if let Err(e) =
 			unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES) }
 		{
@@ -605,20 +546,16 @@ impl GpuScaler {
 				return Err(format!("scaler: fence wait failed: {e:?}"));
 			}
 		}
-
 		if fresh {
 			self.src_image.as_mut().expect("src image").fresh = false;
 		}
-
 		if std::env::var("MOONSHINE_SCALE_DUMP").is_ok()
 			&& !self.dumped_dst.swap(true, std::sync::atomic::Ordering::SeqCst)
 		{
 			dump_gpu_image_to_png(&self.context, image, src_w, src_h, "/tmp/moonshine_upload_debug.png");
 		}
-
 		Ok(image)
 	}
-
 	#[allow(clippy::too_many_arguments)]
 	pub fn scale(
 		&mut self,
@@ -632,7 +569,6 @@ impl GpuScaler {
 		src_size: usize,
 	) -> Result<vk::Image, String> {
 		self.wait_previous_submit()?;
-
 		let (src_image, src_view, src_fresh) = {
 			let s = self.ensure_src(src_w, src_h, vk::Format::R8G8B8A8_UNORM)?;
 			(s.image, s.view, s.fresh)
@@ -646,7 +582,6 @@ impl GpuScaler {
 		let fence = self.fence;
 		let command_buffer = self.command_buffer;
 		let queue = self.context.compute_queue();
-
 		if self.descriptor_set.is_none() {
 			let set_layouts = [self.descriptor_set_layout];
 			let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -688,7 +623,6 @@ impl GpuScaler {
 				.image_info(&dst_infos),
 		];
 		unsafe { device.update_descriptor_sets(&bindings, &[]) };
-
 		let src_barrier_in = vk::ImageMemoryBarrier::default()
 			.old_layout(if src_fresh {
 				vk::ImageLayout::UNDEFINED
@@ -723,7 +657,6 @@ impl GpuScaler {
 				vk::AccessFlags::SHADER_READ
 			})
 			.dst_access_mask(vk::AccessFlags::SHADER_WRITE);
-
 		let copy = vk::BufferImageCopy::default()
 			.buffer_offset(0)
 			.buffer_row_length(src_w)
@@ -740,9 +673,7 @@ impl GpuScaler {
 				height: src_h,
 				depth: 1,
 			});
-
 		let push = letterbox_push(src_w, src_h, target_w, target_h);
-
 		if let Err(e) =
 			unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES) }
 		{
@@ -850,7 +781,6 @@ impl GpuScaler {
 				},
 			}
 		}
-
 		if std::env::var("MOONSHINE_SCALE_DUMP").is_ok()
 			&& !self.dumped_dst.swap(true, std::sync::atomic::Ordering::SeqCst)
 		{
@@ -862,25 +792,21 @@ impl GpuScaler {
 				"/tmp/moonshine_dst_debug.png",
 			);
 		}
-
 		if src_fresh {
 			self.src_image.as_mut().expect("src image").fresh = false;
 		}
 		if dst_fresh {
 			self.dst_image.as_mut().expect("dst image").fresh = false;
 		}
-
 		Ok(dst_image)
 	}
 }
-
 fn context_find_host_visible(scaler: &GpuScaler, bits: u32) -> Option<u32> {
 	scaler.context.find_memory_type(
 		bits,
 		vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
 	)
 }
-
 impl Drop for GpuScaler {
 	fn drop(&mut self) {
 		let device = self.context.device();
@@ -917,10 +843,6 @@ impl Drop for GpuScaler {
 		};
 	}
 }
-
-/// GPU image-to-image bilinear scaler. Samples an imported (DMA-BUF or CPU-uploaded)
-/// source image and scales it into a device-local RGBA target using the same compute
-/// shader as [`GpuScaler`]. Letterboxes to preserve aspect ratio.
 pub(crate) struct GpuImageScaler {
 	context: VideoContext,
 	target: Option<GpuImage>,
@@ -931,18 +853,14 @@ pub(crate) struct GpuImageScaler {
 	pipeline: vk::Pipeline,
 	descriptor_pool: vk::DescriptorPool,
 	descriptor_set: Option<vk::DescriptorSet>,
-	/// Source view from the previous submit, kept alive until that submit's
-	/// fence signals (the descriptor references it during GPU execution).
 	pending_view: Option<vk::ImageView>,
 	command_pool: vk::CommandPool,
 	command_buffer: vk::CommandBuffer,
 	fence: vk::Fence,
 }
-
 impl GpuImageScaler {
 	pub fn new(context: VideoContext) -> Result<Self, String> {
 		let device = context.device();
-
 		let command_pool = unsafe {
 			device.create_command_pool(
 				&vk::CommandPoolCreateInfo::default()
@@ -952,7 +870,6 @@ impl GpuImageScaler {
 			)
 		}
 		.map_err(|e| format!("image scaler command pool: {e}"))?;
-
 		let command_buffer = unsafe {
 			device.allocate_command_buffers(
 				&vk::CommandBufferAllocateInfo::default()
@@ -962,7 +879,6 @@ impl GpuImageScaler {
 			)
 		}
 		.map_err(|e| format!("image scaler command buffer alloc: {e}"))?[0];
-
 		let fence = unsafe {
 			device.create_fence(
 				&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -970,7 +886,6 @@ impl GpuImageScaler {
 			)
 		}
 		.map_err(|e| format!("image scaler fence: {e}"))?;
-
 		let sampler_info = vk::SamplerCreateInfo::default()
 			.mag_filter(vk::Filter::LINEAR)
 			.min_filter(vk::Filter::LINEAR)
@@ -983,7 +898,6 @@ impl GpuImageScaler {
 			.max_anisotropy(1.0);
 		let sampler =
 			unsafe { device.create_sampler(&sampler_info, None) }.map_err(|e| format!("image scaler sampler: {e}"))?;
-
 		let bindings = [
 			vk::DescriptorSetLayoutBinding::default()
 				.binding(0)
@@ -1000,7 +914,6 @@ impl GpuImageScaler {
 			device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
 		}
 		.map_err(|e| format!("image scaler dsl: {e}"))?;
-
 		let push_range = vk::PushConstantRange::default()
 			.stage_flags(vk::ShaderStageFlags::COMPUTE)
 			.offset(0)
@@ -1014,7 +927,6 @@ impl GpuImageScaler {
 			)
 		}
 		.map_err(|e| format!("image scaler pipeline layout: {e}"))?;
-
 		let spirv_words = spirv_words(SCALER_SPIRV_BYTES);
 		let shader_info = vk::ShaderModuleCreateInfo::default().code(&spirv_words);
 		let shader_module = unsafe { device.create_shader_module(&shader_info, None) }
@@ -1030,7 +942,6 @@ impl GpuImageScaler {
 		let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) }
 			.map_err(|(_, e)| format!("image scaler compute pipeline: {e:?}"))?[0];
 		unsafe { device.destroy_shader_module(shader_module, None) };
-
 		let descriptor_pool = unsafe {
 			device.create_descriptor_pool(
 				&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
@@ -1045,7 +956,6 @@ impl GpuImageScaler {
 			)
 		}
 		.map_err(|e| format!("image scaler descriptor pool: {e}"))?;
-
 		Ok(Self {
 			context,
 			target: None,
@@ -1062,7 +972,6 @@ impl GpuImageScaler {
 			fence,
 		})
 	}
-
 	fn ensure_target(&mut self, width: u32, height: u32) -> Result<&GpuImage, String> {
 		let needs = self
 			.target
@@ -1086,7 +995,6 @@ impl GpuImageScaler {
 		}
 		Ok(self.target.as_ref().expect("target just created"))
 	}
-
 	#[allow(clippy::too_many_arguments)]
 	pub fn scale(
 		&mut self,
@@ -1101,7 +1009,6 @@ impl GpuImageScaler {
 		let queue = self.context.compute_queue();
 		let fence = self.fence;
 		let command_buffer = self.command_buffer;
-
 		{
 			let device = self.context.device();
 			if let Err(e) = unsafe { device.wait_for_fences(&[fence], true, 5_000_000_000) } {
@@ -1110,20 +1017,15 @@ impl GpuImageScaler {
 			if let Err(e) = unsafe { device.reset_fences(&[fence]) } {
 				tracing::warn!("image scaler: failed to reset fence: {e:?}");
 			}
-			// The previous submit has completed: its source view is no longer
-			// referenced by the GPU and can be destroyed now.
 			if let Some(old_view) = self.pending_view.take() {
 				unsafe { device.destroy_image_view(old_view, None) };
 			}
 		}
-
 		let target = self.ensure_target(target_w, target_h)?;
 		let target_image = target.image;
 		let dst_view = target.view;
 		let target_fresh = self.target_fresh;
 		let device = self.context.device();
-
-		// Reuse a single descriptor set, resetting its pool each frame.
 		if self.descriptor_set.is_none() {
 			let set_layouts = [self.descriptor_set_layout];
 			let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -1139,9 +1041,6 @@ impl GpuImageScaler {
 			tracing::warn!("image scaler: failed to reset descriptor pool: {e:?}");
 		}
 		let descriptor_set = self.descriptor_set.expect("descriptor set allocated above");
-
-		// Create a sampler view over the imported source image. The view format must
-		// match the actual source image format (the imported DMA-BUF / uploaded image).
 		let src_view_info = vk::ImageViewCreateInfo::default()
 			.image(src)
 			.view_type(vk::ImageViewType::TYPE_2D)
@@ -1149,7 +1048,6 @@ impl GpuImageScaler {
 			.subresource_range(full_range());
 		let src_view = unsafe { device.create_image_view(&src_view_info, None) }
 			.map_err(|e| format!("image scaler src view: {e}"))?;
-
 		let src_info = vk::DescriptorImageInfo::default()
 			.sampler(self.sampler)
 			.image_view(src_view)
@@ -1174,16 +1072,6 @@ impl GpuImageScaler {
 				.image_info(&dst_infos),
 		];
 		unsafe { device.update_descriptor_sets(&bindings, &[]) };
-
-		// The imported source image may be in UNDEFINED (first import) or GENERAL
-		// (cached) layout; transition it to GENERAL for sampling.
-		//
-		// DMA-BUF imports are created with EXCLUSIVE sharing and foreign ownership
-		// (see `dmabuf.rs`), so the *first* use must include a queue-family acquire:
-		// srcQueueFamilyIndex = QUEUE_FAMILY_EXTERNAL, dstQueueFamilyIndex = our
-		// compute family. Without this the device never gains ownership of the
-		// external memory and sampling reads uninitialized data (black frames).
-		// Cached images already belong to us, so plain IGNORED/IGNORED is correct.
 		let needs_acquire = src_layout == vk::ImageLayout::UNDEFINED;
 		let src_barrier = vk::ImageMemoryBarrier::default()
 			.old_layout(src_layout)
@@ -1202,9 +1090,6 @@ impl GpuImageScaler {
 			.subresource_range(full_range())
 			.src_access_mask(vk::AccessFlags::empty())
 			.dst_access_mask(vk::AccessFlags::SHADER_READ);
-		// Freshly (re)created targets start in UNDEFINED; reused targets rest in
-		// GENERAL from the previous frame's release barrier. The target is
-		// written as a storage image, so it must be GENERAL at dispatch time.
 		let dst_barrier_in = vk::ImageMemoryBarrier::default()
 			.old_layout(if target_fresh {
 				vk::ImageLayout::UNDEFINED
@@ -1231,9 +1116,7 @@ impl GpuImageScaler {
 			.subresource_range(full_range())
 			.src_access_mask(vk::AccessFlags::SHADER_WRITE)
 			.dst_access_mask(vk::AccessFlags::SHADER_READ);
-
 		let push = letterbox_push(src_w, src_h, target_w, target_h);
-
 		if let Err(e) =
 			unsafe { device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::RELEASE_RESOURCES) }
 		{
@@ -1298,17 +1181,11 @@ impl GpuImageScaler {
 				)
 				.map_err(|e| format!("image scaler submit: {e}"))?;
 		}
-
-		// The source view is referenced by the submitted descriptor set for as
-		// long as the GPU executes this submit. Retire it on the next frame
-		// (after the fence signals) instead of destroying it while in flight.
 		self.pending_view = Some(src_view);
 		self.target_fresh = false;
-
 		Ok(target_image)
 	}
 }
-
 impl Drop for GpuImageScaler {
 	fn drop(&mut self) {
 		if let Some(t) = self.target.take() {
@@ -1339,9 +1216,6 @@ impl Drop for GpuImageScaler {
 		};
 	}
 }
-
-/// One-shot diagnostic: write RGBA rows from a CPU pointer to a PNG. Used to tell
-/// whether the *source* capture is black or valid. `row_pitch` is bytes per row.
 fn dump_rgba_to_png(src: *const u8, width: u32, height: u32, row_pitch: u32, path: &str) {
 	let rp = row_pitch as usize;
 	let mut rgba = vec![0u8; (width as usize * 4) * height as usize];
@@ -1358,15 +1232,9 @@ fn dump_rgba_to_png(src: *const u8, width: u32, height: u32, row_pitch: u32, pat
 		None => tracing::warn!("src dump: from_raw returned None"),
 	}
 }
-
-/// One-shot diagnostic: copy a device-local R8G8B8A8_UNORM image back to CPU and
-/// write a PNG. Used to tell whether the *scaled GPU output* is black or correct.
-/// The image must rest in GENERAL layout (the scaler's release barrier leaves it
-/// there); it is returned to GENERAL afterwards.
 fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, height: u32, path: &str) {
 	let device = context.device();
 	let size = (width as u64 * height as u64 * 4).max(1);
-
 	let buf = match unsafe {
 		device.create_buffer(
 			&vk::BufferCreateInfo::default()
@@ -1417,7 +1285,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		tracing::warn!("dst dump: bind failed: {e}");
 		return;
 	}
-
 	let pool = match unsafe {
 		device.create_command_pool(
 			&vk::CommandPoolCreateInfo::default()
@@ -1468,10 +1335,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 			return;
 		},
 	};
-
-	// The image rests in GENERAL (the scaler's release barrier). Transition it
-	// to TRANSFER_SRC_OPTIMAL for the readback copy, then back to GENERAL so
-	// the scaler's barriers keep assuming GENERAL as the resting layout.
 	let to_src = vk::ImageMemoryBarrier::default()
 		.old_layout(vk::ImageLayout::GENERAL)
 		.new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
@@ -1490,7 +1353,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		.subresource_range(full_range())
 		.src_access_mask(vk::AccessFlags::TRANSFER_READ)
 		.dst_access_mask(vk::AccessFlags::SHADER_READ);
-
 	let copy = vk::BufferImageCopy::default()
 		.buffer_offset(0)
 		.buffer_row_length(width)
@@ -1507,7 +1369,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 			height,
 			depth: 1,
 		});
-
 	let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 	let ok = (|| -> bool {
 		if unsafe { device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }.is_err() {
@@ -1549,7 +1410,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		}
 		true
 	})();
-
 	if !ok {
 		unsafe {
 			device.destroy_fence(fence, None);
@@ -1561,7 +1421,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		tracing::warn!("dst dump: command submit failed");
 		return;
 	}
-
 	let mapped = match unsafe { device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
 		Ok(p) => p as *const u8,
 		Err(e) => {
@@ -1584,7 +1443,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		unsafe { std::ptr::copy_nonoverlapping(srow, drow.as_mut_ptr(), row_pitch) };
 	}
 	unsafe { device.unmap_memory(mem) };
-
 	unsafe {
 		device.destroy_fence(fence, None);
 		device.free_command_buffers(pool, &[cb]);
@@ -1592,7 +1450,6 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		device.free_memory(mem, None);
 		device.destroy_buffer(buf, None);
 	};
-
 	match image::RgbaImage::from_raw(width, height, rgba) {
 		Some(img) => match img.save(path) {
 			Ok(_) => tracing::info!("dst dump: wrote {path} ({}x{})", width, height),
@@ -1601,11 +1458,9 @@ fn dump_gpu_image_to_png(context: &VideoContext, image: vk::Image, width: u32, h
 		None => tracing::warn!("dst dump: from_raw returned None"),
 	}
 }
-
 #[cfg(test)]
 mod tests {
 	use super::letterbox_push;
-
 	fn unpack(push: [u32; 10]) -> (u32, u32, u32, u32, f32, f32, u32, u32, u32, u32) {
 		(
 			push[0],
@@ -1620,7 +1475,6 @@ mod tests {
 			push[9],
 		)
 	}
-
 	#[test]
 	fn letterbox_same_aspect_is_full_bleed() {
 		let (_, _, _, _, inv_w, inv_h, off_x, off_y, out_w, out_h) = unpack(letterbox_push(1920, 1080, 1920, 1080));
@@ -1628,10 +1482,8 @@ mod tests {
 		assert!((inv_w - 1.0 / 1920.0).abs() < f32::EPSILON);
 		assert!((inv_h - 1.0 / 1080.0).abs() < f32::EPSILON);
 	}
-
 	#[test]
 	fn letterbox_wide_src_in_narrow_dst_bars_top_bottom() {
-		// 16:9 source into a 4:3-ish target: fit width, center vertically.
 		let (_, _, _, _, inv_w, inv_h, off_x, off_y, out_w, out_h) = unpack(letterbox_push(1920, 1080, 1280, 1080));
 		assert_eq!(out_w, 1280);
 		assert_eq!(out_h, 720);
@@ -1640,21 +1492,16 @@ mod tests {
 		assert!((inv_w - 1.0 / 1280.0).abs() < f32::EPSILON);
 		assert!((inv_h - 1.0 / 720.0).abs() < f32::EPSILON);
 	}
-
 	#[test]
 	fn letterbox_narrow_src_in_wide_dst_bars_left_right() {
-		// 4:3 source into 16:9 target: fit height, center horizontally.
 		let (_, _, _, _, _, _, off_x, off_y, out_w, out_h) = unpack(letterbox_push(1280, 960, 1920, 1080));
 		assert_eq!(out_h, 1080);
 		assert_eq!(out_w, 1440);
 		assert_eq!(off_x, (1920 - 1440) / 2);
 		assert_eq!(off_y, 0);
 	}
-
 	#[test]
 	fn letterbox_uv_covers_fitted_rect_exactly() {
-		// The inverse scale must map the fitted rect (not the whole dst) onto
-		// the full source, otherwise the image stretches or crops.
 		let (_, _, dst_w, dst_h, inv_w, inv_h, off_x, off_y, out_w, out_h) =
 			unpack(letterbox_push(2560, 1440, 1920, 1080));
 		assert_eq!((dst_w, dst_h, off_x, off_y), (1920, 1080, 0, 0));

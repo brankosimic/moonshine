@@ -1,26 +1,9 @@
-//! Desktop-stream frame handling: turns captured portal frames (PipeWire
-//! DMA-BUF or CPU-mapped buffers) into Vulkan images the shared video
-//! pipeline can color-convert and encode.
-//!
-//! Three paths, best-first with CPU fallback everywhere:
-//! 1. DMA-BUF zero-copy import (vendor-independent via
-//!    VK_EXT_image_drm_format_modifier + VK_KHR_external_memory_fd).
-//! 2. CPU upload of mapped (memfd/memptr) buffers into a staging image.
-//! 3. On import failure: mmap the DMA-BUF and treat it like a CPU buffer.
-//!
-//! When the capture size differs from the negotiated stream size the frame is
-//! letterbox-scaled on the GPU (compute shader shared with the game
-//! compositor's scaler) before the color converter — the converter is
-//! configured at the negotiated size and cannot sample other dimensions.
-
-use ash::vk;
-use pixelforge::{InputFormat, VideoContext};
-
 use super::dmabuf::{DmaBufImporter, DmaBufPlane};
 use super::gpu_copy::map_dmabuf_plane;
 use super::gpu_scaler::{GpuImageScaler, GpuScaler};
 use crate::session::desktop::frame::ExportedFrame;
-
+use ash::vk;
+use pixelforge::{InputFormat, VideoContext};
 pub(crate) enum DesktopFrameResult {
 	Ready {
 		source_image: vk::Image,
@@ -30,19 +13,15 @@ pub(crate) enum DesktopFrameResult {
 	Dropped,
 	Fatal(String),
 }
-
 fn is_8bit_fourcc(fourcc: u32) -> bool {
 	matches!(fourcc, 0x34324241 | 0x34324258 | 0x34325241 | 0x34325258)
 }
-
 fn is_bgrx_order(fourcc: u32) -> bool {
 	matches!(fourcc, 0x34325241 | 0x34325258)
 }
-
 fn is_device_lost(e: &str) -> bool {
 	e.to_lowercase().contains("device has been lost")
 }
-
 pub(crate) struct DesktopFrameHandler {
 	context: VideoContext,
 	target_width: u32,
@@ -51,7 +30,6 @@ pub(crate) struct DesktopFrameHandler {
 	image_scaler: Option<GpuImageScaler>,
 	dmabuf_importer: Option<DmaBufImporter>,
 }
-
 impl DesktopFrameHandler {
 	pub(crate) fn new(context: VideoContext, target_width: u32, target_height: u32) -> Self {
 		Self {
@@ -63,30 +41,24 @@ impl DesktopFrameHandler {
 			dmabuf_importer: None,
 		}
 	}
-
 	fn scaler(&mut self) -> Result<&mut GpuScaler, String> {
 		if self.scaler.is_none() {
 			self.scaler = Some(GpuScaler::new(self.context.clone())?);
 		}
 		Ok(self.scaler.as_mut().unwrap())
 	}
-
 	fn image_scaler(&mut self) -> Result<&mut GpuImageScaler, String> {
 		if self.image_scaler.is_none() {
 			self.image_scaler = Some(GpuImageScaler::new(self.context.clone())?);
 		}
 		Ok(self.image_scaler.as_mut().unwrap())
 	}
-
 	fn importer(&mut self) -> Result<&mut DmaBufImporter, String> {
 		if self.dmabuf_importer.is_none() {
 			self.dmabuf_importer = Some(DmaBufImporter::new(self.context.clone())?);
 		}
 		Ok(self.dmabuf_importer.as_mut().unwrap())
 	}
-
-	/// Letterbox-scale a device-local source image (at native capture size,
-	/// `src_layout` resting layout) to the negotiated stream size.
 	fn scale_image_to_target(
 		&mut self,
 		image: vk::Image,
@@ -104,12 +76,8 @@ impl DesktopFrameHandler {
 			target_w,
 			target_h,
 		)?;
-		// The scaler's target is an R8G8B8A8_UNORM image left in GENERAL.
 		Ok((scaled, vk::ImageLayout::GENERAL))
 	}
-
-	/// Upload CPU-visible pixels at native capture size into a device-local
-	/// image resting in GENERAL layout.
 	fn upload_pixels(
 		&mut self,
 		ptr: *const u8,
@@ -122,25 +90,19 @@ impl DesktopFrameHandler {
 		self.scaler()?
 			.upload(ptr, frame.width, frame.height, stride, vk_format, bpp, mapped_size)
 	}
-
 	pub(crate) fn handle_frame(
 		&mut self,
 		frame: &ExportedFrame,
 		fourcc: u32,
 	) -> (DesktopFrameResult, Option<vk::Format>) {
 		let (input_format, import_vk_format) = super::drm_fourcc_to_input(fourcc);
-
 		let Some(plane) = frame.planes.first() else {
 			return (DesktopFrameResult::Dropped, None);
 		};
 		let mapped_ptr = plane.mapped_ptr.map(|p| p.0);
-
 		let size_mismatch = frame.width != self.target_width || frame.height != self.target_height;
 		let (target_w, target_h) = (self.target_width, self.target_height);
-
 		let outcome: Result<(vk::Image, vk::ImageLayout, InputFormat), String> = 'frame: {
-			// Fast path for 8-bit CPU-mapped frames that need scaling: the
-			// compute scaler swizzles and letterbox-scales in a single pass.
 			if let Some(ptr) = mapped_ptr
 				&& size_mismatch
 				&& is_8bit_fourcc(fourcc)
@@ -163,9 +125,6 @@ impl DesktopFrameHandler {
 					Err(e) => tracing::warn!("GPU scale failed: {e}; falling back to upload + image scale."),
 				}
 			}
-
-			// CPU-mapped capture (memfd/memptr, or mmap'd DMA-BUF fallback):
-			// upload at native size.
 			if let Some(ptr) = mapped_ptr {
 				let image = match self.upload_pixels(
 					ptr,
@@ -180,15 +139,12 @@ impl DesktopFrameHandler {
 					Err(e) => break 'frame Err(format!("CPU upload failed: {e}")),
 				};
 				if size_mismatch {
-					// The converter is configured at the negotiated size; feeding
-					// it a native-size image would sample out of bounds.
 					self.scale_image_to_target(image, import_vk_format, vk::ImageLayout::GENERAL, frame)
 						.map(|(image, layout)| (image, layout, InputFormat::RGBA))
 				} else {
 					Ok((image, vk::ImageLayout::GENERAL, input_format))
 				}
 			} else {
-				// Pure DMA-BUF: try zero-copy import first.
 				let plane_count = frame.planes.len().min(4);
 				let mut planes_buf = [DmaBufPlane {
 					fd: 0,
@@ -205,14 +161,11 @@ impl DesktopFrameHandler {
 					};
 				}
 				let planes = &planes_buf[..plane_count];
-
 				let import = self
 					.importer()
 					.and_then(|i| i.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes));
 				match import {
 					Ok((source_import, needs_transition)) => {
-						// `import` holds the `Arc` for this arm, so the image
-						// outlives the scaler and the converter's cached view.
 						let image = source_import.image();
 						let imported_layout = if needs_transition {
 							vk::ImageLayout::UNDEFINED
@@ -227,8 +180,6 @@ impl DesktopFrameHandler {
 						}
 					},
 					Err(e) => {
-						// Some drivers reject the import (e.g. NVIDIA at large
-						// resolutions): mmap the DMA-BUF and upload via CPU.
 						tracing::warn!("Failed to import DMA-BUF: {e}; falling back to CPU upload.");
 						let Some((ptr, size)) =
 							map_dmabuf_plane(planes[0].fd, planes[0].offset, planes[0].stride, frame.height)
@@ -271,7 +222,6 @@ impl DesktopFrameHandler {
 				}
 			}
 		};
-
 		match outcome {
 			Ok((source_image, src_layout, input_format)) => (
 				DesktopFrameResult::Ready {
@@ -292,27 +242,16 @@ impl DesktopFrameHandler {
 		}
 	}
 }
-
-/// Coalesces client reference-frame-invalidation (RFI) requests for desktop
-/// streams: a desynced client re-requests at up to report rate, and honoring
-/// each with a full IDR amplifies the very packet loss that caused the
-/// desync. One IDR per cooldown window is always enough to resync.
 pub(crate) struct InvalidationCoalescer {
 	last_invalidation_time: std::time::Instant,
 }
-
 impl InvalidationCoalescer {
 	const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
-
 	pub(crate) fn new() -> Self {
 		Self {
 			last_invalidation_time: std::time::Instant::now() - Self::COOLDOWN,
 		}
 	}
-
-	/// Whether a drained batch of invalidation requests should be honored now.
-	/// `first` is the earliest requested display order, if any request carried
-	/// a frame range (a lag-only batch has none and just needs an IDR).
 	pub(crate) fn should_honor(&mut self, first: Option<u64>) -> bool {
 		if self.last_invalidation_time.elapsed() < Self::COOLDOWN {
 			tracing::debug!(
