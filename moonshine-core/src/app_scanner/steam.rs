@@ -103,6 +103,7 @@ pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) ->
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),
 				launch_timeout_secs: config.launch_timeout_secs,
+				desktop: false,
 				// Steam launches these, so Steam's focus contract applies.
 				steam_integration: true,
 			};

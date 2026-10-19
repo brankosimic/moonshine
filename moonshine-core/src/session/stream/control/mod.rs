@@ -12,10 +12,7 @@ use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::{
-	frame::{HdrMetadata, HdrModeState},
-	input::CompositorInput,
-};
+use crate::session::compositor::frame::{HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::AudioStartHandle;
 use crate::session::stream::video::VideoStreamHandle;
@@ -288,10 +285,10 @@ impl ControlStream {
 	pub fn new(
 		config: ControlStreamConfig,
 		address: String,
-		compositor_input: CompositorInput,
+		input_sink: input::ControlInputSink,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(compositor_input, stop_session_manager.clone(), config.gamepad.clone())?;
+		let input_handler = InputHandler::new(input_sink, stop_session_manager.clone(), config.gamepad.clone())?;
 
 		let socket_address = SocketAddr::new(
 			address

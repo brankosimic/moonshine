@@ -16,6 +16,7 @@ use self::encoder::AudioEncoder;
 use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
 
 mod buffer;
+mod desktop_capture;
 mod encoder;
 mod pulse_server;
 
@@ -171,6 +172,9 @@ pub struct AudioStreamContext {
 	pub audio_config: AudioConfig,
 	/// Whether the client has enabled audio encryption.
 	pub encrypt_audio: bool,
+	/// Desktop streaming: capture the system audio instead of the private
+	/// PulseAudio server (which has no clients in a desktop session).
+	pub desktop: bool,
 }
 
 /// Handle returned by `AudioStream::start` that gates the encoder and packet handler.
@@ -257,21 +261,34 @@ impl AudioStream {
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
 		spawn_handle_audio_packets(packet_rx, self.udp_socket, start_notify.clone(), self.stop.clone());
 
-		// Create frame channels for PulseServer and encoder communication.
+		// Create frame channels for the frame source and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
 		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
 
-		// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
-		PulseServer::spawn(
-			self.pulse_socket,
-			self.pulse_socket_path.clone(),
-			context.audio_config.channels as u8,
-			context.packet_duration_ms,
-			frame_tx,
-			frame_recycle_rx,
-			self.stop.clone(),
-		)
-		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
+		if context.desktop {
+			// Desktop sessions have no application pointed at the private
+			// server; capture the system audio instead. The private socket
+			// stays bound (harmless) but serves no frames.
+			desktop_capture::DesktopAudioCapture::spawn(
+				context.audio_config.channels as u8,
+				context.packet_duration_ms,
+				frame_tx,
+				frame_recycle_rx,
+				self.stop.clone(),
+			)?;
+		} else {
+			// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
+			PulseServer::spawn(
+				self.pulse_socket,
+				self.pulse_socket_path.clone(),
+				context.audio_config.channels as u8,
+				context.packet_duration_ms,
+				frame_tx,
+				frame_recycle_rx,
+				self.stop.clone(),
+			)
+			.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
+		}
 
 		// Spawn audio encoder — gated behind start_notify.
 		AudioEncoder::spawn(

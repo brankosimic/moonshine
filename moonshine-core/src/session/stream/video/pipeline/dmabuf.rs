@@ -172,6 +172,7 @@ pub(crate) struct DmaBufImporter {
 	retired: Vec<Arc<CachedImport>>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
+	failed: HashMap<RawFd, ImportParams>,
 }
 
 impl DmaBufImporter {
@@ -185,6 +186,7 @@ impl DmaBufImporter {
 			cache: HashMap::new(),
 			retired: Vec::new(),
 			calls_since_sweep: 0,
+			failed: HashMap::new(),
 		})
 	}
 
@@ -206,6 +208,15 @@ impl DmaBufImporter {
 
 		let params = ImportParams::new(width, height, format, planes);
 
+		if let Some(failed_params) = self.failed.get(&fd)
+			&& *failed_params == params
+		{
+			return Err(format!(
+				"DMA-BUF import previously failed for fd {fd} ({}x{}, format={:?}); not retrying",
+				width, height, format
+			));
+		}
+
 		let now = Instant::now();
 		if let Some(cached) = self.cache.get(&fd)
 			&& cached.params == params
@@ -224,6 +235,7 @@ impl DmaBufImporter {
 			stale.touch(now);
 			self.retired.push(stale);
 		}
+		self.failed.remove(&fd);
 
 		debug!(
 			"First import for fd {fd}: {}x{}, format={:?}, stride={}, modifier={:#x}",
@@ -235,7 +247,13 @@ impl DmaBufImporter {
 			.try_clone_to_owned()
 			.map_err(|e| format!("Failed to duplicate DMA-BUF FD for the import cache: {e}"))?;
 
-		let (image, memory) = self.import_internal(width, height, format, planes)?;
+		let (image, memory) = match self.import_internal(width, height, format, planes) {
+			Ok(v) => v,
+			Err(e) => {
+				self.failed.insert(fd, params);
+				return Err(e);
+			},
+		};
 
 		let cached = Arc::new(CachedImport {
 			image,
@@ -371,10 +389,34 @@ impl DmaBufImporter {
 			memory_type_bits
 		);
 
-		let memory_type_index = self
+		let memory_type_index = match self
 			.context
 			.find_memory_type(memory_type_bits, vk::MemoryPropertyFlags::empty())
-			.ok_or_else(|| "No suitable memory type for DMA-BUF import".to_string())?;
+		{
+			Some(idx) => idx,
+			None => {
+				diagnose_dmabuf_import_failure(
+					&self.context,
+					ImportDiag {
+						fd,
+						width,
+						height,
+						format,
+						modifier,
+						image_bits: mem_requirements.memory_type_bits,
+						fd_bits: memory_fd_properties.memory_type_bits,
+						size: mem_requirements.size,
+					},
+				);
+				return Err(format!(
+					"No suitable memory type for DMA-BUF import (image_bits={:#x}, fd_bits={:#x}, combined={:#x}, size={})",
+					mem_requirements.memory_type_bits,
+					memory_fd_properties.memory_type_bits,
+					memory_type_bits,
+					mem_requirements.size,
+				));
+			},
+		};
 
 		// Dedicated allocation (required by many drivers for external memory).
 		let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
@@ -399,6 +441,54 @@ impl DmaBufImporter {
 		}
 
 		Ok((image, memory))
+	}
+}
+
+/// Context for a failed DMA-BUF import, passed to the one-shot diagnostic.
+struct ImportDiag {
+	fd: RawFd,
+	width: u32,
+	height: u32,
+	format: vk::Format,
+	modifier: u64,
+	image_bits: u32,
+	fd_bits: u32,
+	size: u64,
+}
+
+/// One-shot diagnostic: on a failed DMA-BUF import, dump the device's full
+/// memory-type table plus the image/fd bit sets so we can see which memory
+/// types exist, which the image wants, and why the fd reported none. Gated on
+/// `MOONSHINE_DMABUF_DIAG` to avoid per-frame log spam (logs at most once).
+fn diagnose_dmabuf_import_failure(context: &VideoContext, d: ImportDiag) {
+	static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+	if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) || std::env::var("MOONSHINE_DMABUF_DIAG").is_err() {
+		return;
+	}
+
+	let instance = context.instance();
+	let phys = context.physical_device();
+	let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
+
+	tracing::warn!(
+		fd = d.fd, width = d.width, height = d.height, ?d.format, modifier = d.modifier,
+		size = d.size, image_bits = d.image_bits, fd_bits = d.fd_bits,
+		"DMA-BUF import failure diagnostic — memory type table:"
+	);
+	for (i, mt) in mem_props.memory_types.iter().enumerate() {
+		let wanted_by_image = d.image_bits & (1 << i) != 0;
+		let offered_by_fd = d.fd_bits & (1 << i) != 0;
+		tracing::warn!(
+			type_index = i,
+			flags = ?mt.property_flags,
+			heap_index = mt.heap_index,
+			wanted_by_image,
+			offered_by_fd,
+			"  memory type"
+		);
+	}
+	for (i, heap) in mem_props.memory_heaps.iter().enumerate() {
+		tracing::warn!(heap_index = i, size = heap.size, "  memory heap");
 	}
 }
 

@@ -3,8 +3,11 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod desktop_frame;
 mod dmabuf;
 mod fence;
+mod gpu_copy;
+mod gpu_scaler;
 mod hdr_sei;
 
 use std::os::fd::AsRawFd;
@@ -20,7 +23,10 @@ use tokio::sync::{Notify, broadcast, mpsc, watch};
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState, color_space, hdr_metadata};
+use crate::session::desktop::frame::ExportedFrame;
 use crate::session::manager::SessionShutdownReason;
+
+use desktop_frame::{DesktopFrameHandler, DesktopFrameResult, InvalidationCoalescer};
 
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
@@ -49,6 +55,25 @@ use pixelforge::{
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
 /// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
+/// Desktop sessions use a slightly deeper in-flight window: the portal capture
+/// is event-driven and can burst, so a little more slack keeps the stream fed
+/// without adding meaningful latency.
+const DESKTOP_MAX_FRAMES_IN_FLIGHT: usize = 4;
+
+/// Where the pipeline's frames come from.
+///
+/// Game sessions are composited by ferriscope and deliver its [`ferriscope_core::Frame`]s
+/// through a [`CompositorFrames`] channel. Desktop sessions capture the host
+/// desktop through the XDG portal, which produces our own [`ExportedFrame`]s
+/// (DMA-BUF *or* CPU-mapped) over a plain mpsc channel — ferriscope's frame
+/// type cannot be constructed outside of ferriscope itself.
+pub(crate) enum FrameSource {
+	/// Ferriscope-composited game frames.
+	Game(CompositorFrames),
+	/// Portal-captured desktop frames.
+	Desktop(std::sync::mpsc::Receiver<ExportedFrame>),
+}
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
@@ -430,7 +455,7 @@ async fn run_packet_consumer(
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		frames: CompositorFrames,
+		frames: FrameSource,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
@@ -491,7 +516,7 @@ impl VideoPipelineInner {
 	fn run(
 		self,
 		runtime: tokio::runtime::Handle,
-		frames: CompositorFrames,
+		frames: FrameSource,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
@@ -531,21 +556,38 @@ impl VideoPipelineInner {
 			},
 		};
 
-		// Start the capture and encoding loop.
-		if let Err(e) = self.run_encoding_loop(
-			runtime,
-			frames,
-			context,
-			encoder,
-			packet_tx,
-			idr_tx,
-			idr_frame_request_rx,
-			invalidate_request_rx,
-			reset_request_rx,
-			stop_session_manager,
-			hdr_metadata_tx,
-			stats_tx,
-		) {
+		// Start the capture and encoding loop for the appropriate frame source.
+		let result = match frames {
+			FrameSource::Game(frames) => self.run_game_encoding_loop(
+				runtime,
+				frames,
+				context,
+				encoder,
+				packet_tx,
+				idr_tx,
+				idr_frame_request_rx,
+				invalidate_request_rx,
+				reset_request_rx,
+				stop_session_manager,
+				hdr_metadata_tx,
+				stats_tx,
+			),
+			FrameSource::Desktop(frame_rx) => self.run_desktop_encoding_loop(
+				runtime,
+				frame_rx,
+				context,
+				encoder,
+				packet_tx,
+				idr_tx,
+				idr_frame_request_rx,
+				invalidate_request_rx,
+				reset_request_rx,
+				stop_session_manager,
+				hdr_metadata_tx,
+				stats_tx,
+			),
+		};
+		if let Err(e) = result {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
 
@@ -610,7 +652,7 @@ impl VideoPipelineInner {
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	fn run_encoding_loop(
+	fn run_game_encoding_loop(
 		&self,
 		runtime: tokio::runtime::Handle,
 		frames: CompositorFrames,
@@ -1131,6 +1173,400 @@ impl VideoPipelineInner {
 		drop(frame_ctx_tx);
 		// Wait for the consumer task to drain and send the remaining packets. This
 		// runs on a plain OS thread outside the runtime, so block on the task handle.
+		if let Err(e) = runtime.block_on(consumer) {
+			tracing::warn!("Packet consumer task panicked: {e:?}");
+		}
+
+		Ok(())
+	}
+
+	/// Encoding loop for desktop (portal-captured) sessions. Mirrors
+	/// [`Self::run_game_encoding_loop`] but pulls frames from the portal capture
+	/// channel ([`ExportedFrame`], DMA-BUF or CPU-mapped) and imports them through
+	/// [`DesktopFrameHandler`], which also letterbox-scales a mismatched capture to
+	/// the negotiated stream size.
+	#[allow(clippy::too_many_arguments)]
+	fn run_desktop_encoding_loop(
+		&self,
+		runtime: tokio::runtime::Handle,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		context: VideoContext,
+		mut encoder: Encoder,
+		packet_tx: mpsc::Sender<ShardBatch>,
+		idr_tx: broadcast::Sender<()>,
+		mut idr_frame_request_rx: broadcast::Receiver<()>,
+		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		mut reset_request_rx: broadcast::Receiver<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	) -> Result<(), String> {
+		let ctx = &self.context;
+
+		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+
+		let max_in_flight = DESKTOP_MAX_FRAMES_IN_FLIGHT;
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(max_in_flight + 2);
+		let consumer = {
+			let ctx = self.context.clone();
+			let config = self.config.clone();
+			let in_flight = in_flight.clone();
+			runtime.spawn(run_packet_consumer(
+				frame_ctx_rx,
+				packet_tx,
+				stats_tx,
+				in_flight,
+				idr_tx.clone(),
+				packetizer,
+				ctx,
+				config,
+			))
+		};
+
+		let mut last_drop_warn: Option<std::time::Instant> = None;
+
+		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
+			(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => OutputFormat::NV12,
+			(VideoChromaSampling::Yuv420, VideoDynamicRange::Hdr) => OutputFormat::P010,
+			(VideoChromaSampling::Yuv444, VideoDynamicRange::Sdr) => OutputFormat::YUV444,
+			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
+		};
+
+		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
+			std::collections::HashMap::new();
+
+		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
+		let mut last_frame_time = std::time::Instant::now();
+
+		// Desktop sessions stretch the IDR backstop: a high-bitrate keyframe is a
+		// burst of UDP packets that on lossy links itself causes loss → client RFI →
+		// another keyframe. Games keep the short period.
+		let idr_period = std::time::Duration::from_secs(10);
+		let mut last_idr_time = std::time::Instant::now();
+
+		let mut desktop_handler: Option<DesktopFrameHandler> = None;
+		let mut has_encoded = false;
+
+		let mut submitted_count: u64 = 0;
+		let mut frame_number_base: u64 = 0;
+
+		let mut invalidation_coalescer = InvalidationCoalescer::new();
+
+		let mut last_hdr_state = HdrModeState {
+			enabled: ctx.dynamic_range == VideoDynamicRange::Hdr,
+			metadata: None,
+		};
+
+		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
+			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
+			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
+		});
+
+		while !stop_session_manager.is_shutdown_triggered() {
+			let mut pending_idr = false;
+
+			let mut pending_reset = false;
+			loop {
+				match reset_request_rx.try_recv() {
+					Ok(()) => pending_reset = true,
+					Err(broadcast::error::TryRecvError::Lagged(_)) => pending_reset = true,
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+			if pending_reset {
+				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
+				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters);
+				frame_number_base = submitted_count;
+				encoder.request_idr();
+				pending_idr = true;
+			}
+
+			loop {
+				match idr_frame_request_rx.try_recv() {
+					Ok(()) => {
+						tracing::debug!("IDR frame requested");
+						encoder.request_idr();
+						pending_idr = true;
+					},
+					Err(broadcast::error::TryRecvError::Lagged(n)) => {
+						tracing::debug!("IDR frame channel lagged by {n} messages.");
+						encoder.request_idr();
+						pending_idr = true;
+					},
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+
+			let mut invalidation_first: Option<u64> = None;
+			let mut saw_invalidation = false;
+			loop {
+				match invalidate_request_rx.try_recv() {
+					Ok((first, _last)) => {
+						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
+						tracing::debug!(
+							"Reference frame invalidation requested from client frame {first} (display order {first_display_order}); forcing IDR"
+						);
+						saw_invalidation = true;
+						invalidation_first =
+							Some(invalidation_first.map_or(first_display_order, |e: u64| e.min(first_display_order)));
+					},
+					Err(broadcast::error::TryRecvError::Lagged(n)) => {
+						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
+						saw_invalidation = true;
+					},
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+			if saw_invalidation && invalidation_coalescer.should_honor(invalidation_first) {
+				if let Some(first_display_order) = invalidation_first {
+					encoder.invalidate_reference_frames(first_display_order);
+				}
+				encoder.request_idr();
+				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
+			}
+
+			// Periodic IDR backstop so a desynced client can resync even if it
+			// never sends a reference-frame-invalidation.
+			if last_idr_time.elapsed() >= idr_period && has_encoded {
+				encoder.request_idr();
+				pending_idr = true;
+				last_idr_time = std::time::Instant::now();
+			}
+
+			let received_frame = match frame_rx.recv_timeout(frame_interval) {
+				Ok(frame) => Some(frame),
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+					if pending_idr && has_encoded {
+						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
+						let now = std::time::Instant::now();
+						match encoder.encode(encoder.input_image()) {
+							Ok(future) => {
+								let submitted_at = std::time::Instant::now();
+								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+								let frame_context = FrameContext {
+									created_at: now,
+									sequence: None,
+									channel_wait: std::time::Duration::ZERO,
+									import: std::time::Duration::ZERO,
+									convert: std::time::Duration::ZERO,
+									submit: submitted_at.duration_since(now),
+									submitted_at,
+									inject_hdr,
+									hdr_metadata: last_hdr_state.metadata,
+								};
+								in_flight.fetch_add(1, Ordering::Relaxed);
+								submitted_count += 1;
+								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
+							},
+							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
+						}
+					}
+					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+						tracing::warn!("No frames received for 5 seconds");
+						last_frame_time = std::time::Instant::now();
+					}
+					None
+				},
+				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+					tracing::debug!("Desktop capture channel disconnected - capture stopped");
+					let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::DesktopStreamStopped);
+					break;
+				},
+			};
+
+			if let Some(frame) = received_frame {
+				if in_flight.load(Ordering::Relaxed) >= max_in_flight {
+					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+						tracing::warn!(
+							"Video encode backpressure: packet consumer is behind; dropping captured \
+							 frames before encode to stay realtime."
+						);
+						last_drop_warn = Some(std::time::Instant::now());
+					}
+					frame.mark_consumed();
+					continue;
+				}
+
+				let t1_received = std::time::Instant::now();
+				let fourcc = frame.format;
+				let (width, height) = (frame.width, frame.height);
+				let captured_at = frame.created_at;
+
+				tracing::trace!(
+					"Received desktop frame: format=0x{fourcc:08X}, modifier={:#x}, {}x{}, planes={}",
+					frame.modifier,
+					width,
+					height,
+					frame.planes.len()
+				);
+
+				let handler = match &mut desktop_handler {
+					Some(h) => h,
+					None => {
+						desktop_handler = Some(DesktopFrameHandler::new(context.clone(), ctx.width, ctx.height));
+						desktop_handler.as_mut().unwrap()
+					},
+				};
+				let (frame_result, _) = handler.handle_frame(&frame, fourcc);
+				let (source_image, src_layout, frame_input_format) = match frame_result {
+					DesktopFrameResult::Ready {
+						source_image,
+						src_layout,
+						input_format,
+					} => (source_image, src_layout, input_format),
+					DesktopFrameResult::Dropped => {
+						frame.mark_consumed();
+						continue;
+					},
+					DesktopFrameResult::Fatal(e) => return Err(e),
+				};
+				let t2_imported = std::time::Instant::now();
+
+				let (converter, cached_source) = match color_converters.entry(fourcc) {
+					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+					std::collections::hash_map::Entry::Vacant(e) => {
+						let (color_space, full_range) = match ctx.dynamic_range {
+							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
+							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
+						};
+						let mut config =
+							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
+						config.color_space = color_space;
+						config.full_range = full_range;
+						match ColorConverter::new(context.clone(), config) {
+							Ok(conv) => {
+								tracing::debug!("Created color converter for input format {frame_input_format:?}");
+								e.insert((conv, None))
+							},
+							Err(e) => {
+								tracing::warn!("Failed to create color converter: {e}");
+								frame.mark_consumed();
+								continue;
+							},
+						}
+					},
+				};
+
+				if ctx.dynamic_range == VideoDynamicRange::Hdr {
+					let frame_cs = frame.color_space;
+					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
+						FrameColorSpace::Srgb => (
+							ColorSpace::Bt709,
+							ctx.full_range,
+							ColorDescription::bt709().with_full_range(ctx.full_range),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::Bt2020Pq => (
+							ColorSpace::Bt2020,
+							ctx.full_range,
+							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::ScrgbLinear => (
+							ColorSpace::Bt709LinearToBt2020Pq,
+							ctx.full_range,
+							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
+							SCRGB_REFERENCE_WHITE_NITS,
+						),
+					};
+
+					if encoder_color_desc != Some(color_desc) {
+						tracing::debug!(
+							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
+						);
+						match encoder.set_color_description(color_desc) {
+							Ok(()) => {
+								encoder_color_desc = Some(color_desc);
+								converter.set_color_space(cs);
+								converter.set_full_range(full_range);
+								converter.set_sdr_reference_white_nits(sdr_white_nits);
+							},
+							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
+						}
+					} else {
+						converter.set_color_space(cs);
+						converter.set_full_range(full_range);
+						converter.set_sdr_reference_white_nits(sdr_white_nits);
+					}
+				}
+
+				*cached_source = None;
+
+				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
+					if is_device_lost(&e) {
+						return Err(format!("GPU color conversion failed: {e}"));
+					}
+					tracing::warn!("GPU color conversion failed: {e}");
+					frame.mark_consumed();
+					continue;
+				}
+
+				let frame_hdr_metadata = frame.hdr_metadata;
+				frame.mark_consumed();
+				drop(frame);
+
+				if ctx.dynamic_range == VideoDynamicRange::Hdr {
+					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+					let new_state = HdrModeState {
+						enabled: hdr_enabled,
+						metadata: frame_hdr_metadata,
+					};
+					if new_state != last_hdr_state {
+						last_hdr_state = new_state.clone();
+						let _ = hdr_metadata_tx.send(new_state);
+					}
+				}
+
+				let t3_converted = std::time::Instant::now();
+				let encode_result = encoder.encode(encoder.input_image());
+				let t4_encoded = std::time::Instant::now();
+
+				match encode_result {
+					Ok(future) => {
+						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+						let frame_context = FrameContext {
+							created_at: captured_at,
+							sequence: None,
+							channel_wait: t1_received.duration_since(captured_at),
+							import: t2_imported.duration_since(t1_received),
+							convert: t3_converted.duration_since(t2_imported),
+							submit: t4_encoded.duration_since(t3_converted),
+							submitted_at: t4_encoded,
+							inject_hdr,
+							hdr_metadata: last_hdr_state.metadata,
+						};
+						in_flight.fetch_add(1, Ordering::Relaxed);
+						submitted_count += 1;
+						if frame_ctx_tx
+							.blocking_send(ConsumerMessage::Frame(frame_context, future))
+							.is_err()
+						{
+							tracing::debug!("Packet consumer gone; stopping encoding loop.");
+							break;
+						}
+					},
+					Err(e) => {
+						if is_device_lost(&e) {
+							return Err(format!("Failed to encode frame: {e}"));
+						}
+						tracing::warn!("Failed to encode frame: {e}");
+					},
+				}
+
+				if !pending_idr {
+					last_frame_time = std::time::Instant::now();
+				}
+				has_encoded = true;
+			}
+		}
+
+		if let Err(e) = encoder.flush() {
+			tracing::warn!("Failed to flush encoder: {e}");
+		}
+		drop(frame_ctx_tx);
 		if let Err(e) = runtime.block_on(consumer) {
 			tracing::warn!("Packet consumer task panicked: {e:?}");
 		}
