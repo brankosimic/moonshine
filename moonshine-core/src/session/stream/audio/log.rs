@@ -18,6 +18,7 @@ pub(crate) fn stream_start(ctx: &AudioStreamContext) {
 		encrypt_audio,
 		qos,
 		packet_duration_ms,
+		..
 	} = ctx;
 	let quality = if *high_quality { "high quality" } else { "low quality" };
 	tracing::info!(
