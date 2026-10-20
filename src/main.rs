@@ -1,4 +1,3 @@
-use moonshine_core::app_scanner;
 use moonshine_core::desktop_streaming;
 use moonshine_core::healthcheck;
 use std::io::IsTerminal;
@@ -74,11 +73,6 @@ async fn main() -> Result<(), ()> {
 	}
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
-
-	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
-	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
-	config.applications.extend(scanned_applications);
-	app_scanner::resolve_missing_boxart(&mut config.applications);
 
 	tracing::debug!("Waiting for D-Bus session bus...");
 	wait_for_dbus().await?;
@@ -243,6 +237,7 @@ impl Moonshine {
 				config.stream.port,
 				config.webserver.clone(),
 				config.applications.clone(),
+				config.application_scanners.clone(),
 				config.stream.desktop,
 				supported_codecs,
 				hdr_supported,

@@ -1,4 +1,5 @@
-use super::pulse_server::{AudioFrame, CAPTURE_SAMPLE_RATE};
+use super::SINK_SAMPLE_RATE;
+use super::pulse_server::AudioFrame;
 use crate::session::manager::SessionShutdownReason;
 use async_shutdown::ShutdownManager;
 use pulseaudio::protocol::{self as pulse};
@@ -117,13 +118,13 @@ async fn capture_loop(
 		.ok_or_else(|| tracing::warn!("Default sink {default_sink:?} has no monitor source."))?;
 	tracing::info!(?monitor, "Recording desktop audio from default sink monitor.");
 	let frame_ms = packet_duration_ms.clamp(1, 100);
-	let samples_per_frame = CAPTURE_SAMPLE_RATE * frame_ms / 1000;
+	let samples_per_frame = SINK_SAMPLE_RATE * frame_ms / 1000;
 	let bytes_per_frame = (samples_per_frame * channels as u32 * 4) as usize;
 	let buffer = RecordBuffer::new(TARGET_BUFFERED_BYTES.max(bytes_per_frame * 4));
 	let capture_spec = pulse::SampleSpec {
 		format: pulse::SampleFormat::Float32Le,
 		channels,
-		sample_rate: CAPTURE_SAMPLE_RATE,
+		sample_rate: SINK_SAMPLE_RATE,
 	};
 	let params = pulse::RecordStreamParams {
 		sample_spec: capture_spec,

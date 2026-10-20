@@ -1,12 +1,14 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::{StartSignal, StartWaiter};
 
 mod gso_socket;
 mod packetizer;
@@ -224,27 +226,23 @@ pub struct VideoStreamContext {
 
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
 ///
-/// The pipeline and packet handler are spawned immediately but block on a `Notify`
+/// The pipeline and packet handler are spawned immediately but wait for the start flag
 /// until `trigger()` is called on `StartB`.
 #[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
-	notify: Arc<Notify>,
+	start: StartSignal,
 	idr_tx: broadcast::Sender<()>,
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
-	reset_tx: broadcast::Sender<()>,
+	/// Set by a resume; the packet handler fires the reset on the client's next PING.
+	resume_pending: Arc<AtomicBool>,
 }
 
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
 	pub fn trigger(&self) {
-		// Call notify_one() twice instead of notify_waiters() because
-		// Notify only wakes tasks already .awaiting; notify_waiters()
-		// is a no-op if no task is waiting yet.  notify_one() stores
-		// a permit so the next notified().await completes immediately.
-		self.notify.notify_one();
-		self.notify.notify_one();
+		self.start.trigger();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
@@ -269,13 +267,16 @@ impl VideoStreamHandle {
 	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
 	/// the jump as massive frame loss and reports a poor connection. This also forces an
 	/// IDR so the resumed client has a decodable starting frame.
+	///
+	/// The reset waits for the client's next PING: a reconnecting client usually arrives
+	/// from a new UDP port, and firing immediately would send the IDR to the old address.
 	pub fn request_reset(&self) {
-		let _ = self.reset_tx.send(());
+		self.resume_pending.store(true, Ordering::Relaxed);
 	}
 
-	/// Clone the start notify for external triggering (e.g. bench binary).
-	pub fn clone_start_notify(&self) -> Arc<Notify> {
-		self.notify.clone()
+	/// The start signal, for external triggering (e.g. bench binary).
+	pub fn start_signal(&self) -> StartSignal {
+		self.start.clone()
 	}
 }
 
@@ -335,7 +336,7 @@ impl VideoStream {
 		}
 
 		// Gate for pipeline + packet handler.
-		let start_notify = Arc::new(Notify::new());
+		let start = StartSignal::new();
 
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
@@ -346,14 +347,22 @@ impl VideoStream {
 
 		// Stream-reset broadcast channel (client reconnect/resume).
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
+		let resume_pending = Arc::new(AtomicBool::new(false));
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<(u32, ShardBatch)>(128);
 
-		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+		// Spawn packet handler — gated behind start.
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx.clone(),
+			resume_pending.clone(),
+			stop.clone(),
+		);
 
-		// Spawn pipeline thread — gated behind start_notify.
+		// Spawn pipeline thread — gated behind start.
 		VideoPipeline::new(
 			frames,
 			config,
@@ -366,31 +375,37 @@ impl VideoStream {
 			reset_tx.subscribe(),
 			stop.clone(),
 			hdr_metadata_tx,
-			start_notify.clone(),
+			start.waiter(),
 			stats_tx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
 		Ok(VideoStreamHandle {
-			notify: start_notify,
+			start,
 			idr_tx,
 			invalidate_tx,
-			reset_tx,
+			resume_pending,
 		})
 	}
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
 	socket: UdpGsoSocket,
-	start: Arc<Notify>,
+	mut start: StartWaiter,
+	reset_tx: broadcast::Sender<u32>,
+	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
 	tokio::spawn(async move {
-		start.notified().await;
+		if !start.wait(&stop_session_manager).await {
+			return;
+		}
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
+		// Epoch of the last reset fired; batches packetized before it carry old counters.
+		let mut reset_epoch = 0u32;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 
@@ -402,9 +417,11 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some(batch)) => {
+						Ok(Some((epoch, batch))) => {
 							if let Some(addr) = client_address {
-								if batch.shard_count() == 0 {
+								// Frames from before a resume's reset would reach the new client
+								// with old frame numbers, making it drop the reset frames as stale.
+								if epoch < reset_epoch || batch.shard_count() == 0 {
 									continue;
 								}
 
@@ -450,6 +467,13 @@ fn spawn_handle_video_packets(
 					if &buf[..len] == b"PING" {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some(address);
+
+						// Fire a resume's reset now that frames reach the client's current address.
+						if resume_pending.swap(false, Ordering::Relaxed) {
+							tracing::info!("Resumed client address is {address}, resetting video stream.");
+							reset_epoch += 1;
+							let _ = reset_tx.send(reset_epoch);
+						}
 					} else {
 						tracing::warn!("Received unknown message on video stream of length {len}.");
 					}
@@ -464,6 +488,28 @@ fn spawn_handle_video_packets(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn shutdown_before_start_releases_packet_handler() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(1);
+		let (reset_tx, _) = broadcast::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		);
+
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
+			.await
+			.expect("packet handler kept its socket after shutdown");
+	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {
 		VideoStreamConfig {

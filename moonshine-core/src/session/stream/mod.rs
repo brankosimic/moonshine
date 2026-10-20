@@ -7,7 +7,10 @@ use crate::session::stream::video::VideoStreamConfig;
 
 pub mod audio;
 pub mod control;
+mod start;
 pub mod video;
+
+pub(crate) use start::{StartSignal, StartWaiter};
 
 /// Desktop streaming mode (Auto/On/Off).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

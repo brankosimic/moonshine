@@ -14,7 +14,7 @@ use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
-use crate::session::stream::audio::AudioStartHandle;
+use crate::session::stream::StartSignal;
 use crate::session::stream::video::VideoStreamHandle;
 
 mod feedback;
@@ -320,7 +320,7 @@ impl ControlStream {
 		stream_timeout: u64,
 		context: ControlStreamContext,
 		video_handle: VideoStreamHandle,
-		audio_trigger: AudioStartHandle,
+		audio_trigger: StartSignal,
 		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) {
 		let Self {
@@ -448,7 +448,7 @@ async fn run_control_loop(
 	stream_timeout: u64,
 	mut host: Host,
 	video_handle: VideoStreamHandle,
-	audio_trigger: AudioStartHandle,
+	audio_trigger: StartSignal,
 	context: ControlStreamContext,
 	input_handler: InputHandler,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,

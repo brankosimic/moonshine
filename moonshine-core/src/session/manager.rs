@@ -12,6 +12,7 @@ use super::SessionKeysSender;
 use super::SessionState;
 use super::compositor::CompositorConfig;
 use super::desktop_session;
+use super::stream::StartSignal;
 use super::stream::audio::AudioStreamConfig;
 use super::stream::audio::AudioStreamContext;
 use super::stream::control::ControlStreamConfig;
@@ -92,11 +93,11 @@ struct SessionManagerInner {
 	/// Watchdog task for monitoring unexpected session shutdowns.
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
 
-	/// Notify to trigger the video pipeline start (used by bench / external callers).
-	video_start_notify: Option<Arc<tokio::sync::Notify>>,
+	/// Starts the video pipeline (used by bench / external callers).
+	video_start: Option<StartSignal>,
 
-	/// Notify to trigger the audio pipeline start (used by bench / external callers).
-	audio_start_notify: Option<Arc<tokio::sync::Notify>>,
+	/// Starts the audio pipeline (used by bench / external callers).
+	audio_start: Option<StartSignal>,
 
 	/// Shutdown manager for the entire application.
 	shutdown: ShutdownManager<ShutdownReason>,
@@ -121,8 +122,8 @@ impl SessionManagerInner {
 		self.keys_tx = None;
 		self.video_stream_context = None;
 		self.audio_stream_context = None;
-		self.video_start_notify = None;
-		self.audio_start_notify = None;
+		self.video_start = None;
+		self.audio_start = None;
 		self.stop = ShutdownManager::new();
 	}
 }
@@ -181,8 +182,8 @@ impl SessionManager {
 			audio_stream_context: None,
 			stats_tx: tokio::sync::broadcast::channel(256).0,
 			stop_watcher: None,
-			video_start_notify: None,
-			audio_start_notify: None,
+			video_start: None,
+			audio_start: None,
 			shutdown: shutdown.clone(),
 			_trigger_token: trigger_token,
 			_delay_token: delay_token,
@@ -209,17 +210,8 @@ impl SessionManager {
 	/// that have no Moonlight client. Must be called after `start_session()`.
 	pub async fn trigger_streams_start(&self) {
 		let inner = self.inner.lock().await;
-		if let Some(notify) = inner.video_start_notify.as_ref() {
-			// Call notify_one() twice instead of notify_waiters() because
-			// Notify only wakes tasks already .awaiting; notify_waiters()
-			// is a no-op if no task is waiting yet.  notify_one() stores
-			// a permit so the next notified().await completes immediately.
-			notify.notify_one();
-			notify.notify_one();
-		}
-		if let Some(notify) = inner.audio_start_notify.as_ref() {
-			notify.notify_one();
-			notify.notify_one();
+		for start in [&inner.video_start, &inner.audio_start].into_iter().flatten() {
+			start.trigger();
 		}
 	}
 
@@ -406,7 +398,8 @@ impl SessionManager {
 					// The reconnecting client is a fresh Moonlight session that expects
 					// frame numbers to start at 1, so reset the video frame counters and
 					// force an IDR; otherwise it sees the running counter as a huge frame
-					// gap and reports a poor connection.
+					// gap and reports a poor connection. The reset fires on the client's
+					// first video PING, once its new address is known.
 					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
 					tracing::info!(
@@ -440,7 +433,7 @@ impl SessionManager {
 		let mut guard = self.inner.lock().await;
 		let video_config = guard.video_config.clone();
 		let stream_timeout = guard.stream_timeout;
-		let (active, video_notify, audio_notify) = launched
+		let result = launched
 			.start(
 				video_config,
 				stream_timeout,
@@ -449,14 +442,23 @@ impl SessionManager {
 				stop,
 				guard.inhibit_sleep,
 			)
-			.await?;
-		guard.session = Some(match active {
-			desktop_session::ActiveState::Regular(a) => SessionState::Active(*a),
-			desktop_session::ActiveState::Desktop(a) => SessionState::DesktopActive(*a),
-		});
-		guard.video_start_notify = Some(video_notify);
-		guard.audio_start_notify = Some(audio_notify);
-		Ok(())
+			.await;
+		match result {
+			Ok((active, video_start, audio_start)) => {
+				guard.session = Some(match active {
+					desktop_session::ActiveState::Regular(a) => SessionState::Active(*a),
+					desktop_session::ActiveState::Desktop(a) => SessionState::DesktopActive(*a),
+				});
+				guard.video_start = Some(video_start);
+				guard.audio_start = Some(audio_start);
+				Ok(())
+			},
+			Err(()) => {
+				guard.reset_session();
+				tracing::error!("Failed to start session streams.");
+				Err(())
+			},
+		}
 	}
 
 	/// Stop the session and return to Uninitialized state.

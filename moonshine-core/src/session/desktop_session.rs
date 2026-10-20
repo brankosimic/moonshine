@@ -3,6 +3,7 @@ use super::SessionShutdownReason;
 use super::compositor::frame::HdrModeState;
 use super::desktop::{Desktop, LaunchedDesktop};
 use super::inhibit::SleepInhibitor;
+use super::stream::StartSignal;
 use super::stream::audio::{AudioStream, AudioStreamConfig, AudioStreamContext};
 use super::stream::control::input::ControlInputSink;
 use super::stream::control::{ControlStream, ControlStreamConfig, ControlStreamContext};
@@ -10,8 +11,7 @@ use super::stream::video::{
 	FrameSource, FrameStats, VideoStream, VideoStreamConfig, VideoStreamContext, VideoStreamHandle,
 };
 use async_shutdown::ShutdownManager;
-use std::sync::Arc;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 pub(crate) enum LaunchedState {
 	Regular(Box<super::LaunchedSession>),
 	Desktop(Box<DesktopLaunchedSession>),
@@ -25,7 +25,7 @@ impl LaunchedState {
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
-	) -> Result<(ActiveState, Arc<Notify>, Arc<Notify>), ()> {
+	) -> Result<(ActiveState, StartSignal, StartSignal), ()> {
 		match self {
 			Self::Regular(session) => {
 				let (active, video_notify, audio_notify) = session
@@ -140,7 +140,7 @@ impl DesktopLaunchedSession {
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
-	) -> Result<(DesktopActiveSession, Arc<Notify>, Arc<Notify>), ()> {
+	) -> Result<(DesktopActiveSession, StartSignal, StartSignal), ()> {
 		let Self {
 			context,
 			launched_desktop,
@@ -171,8 +171,8 @@ impl DesktopLaunchedSession {
 		let audio_trigger = audio
 			.start(audio_ctx, keys_rx)
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
-		let video_start_notify = video_handle.clone_start_notify();
-		let audio_start_notify = audio_trigger.clone_start_notify();
+		let video_start = video_handle.start_signal();
+		let audio_start = audio_trigger.clone();
 		let video_handle_for_resume = video_handle.clone();
 		let control_ctx = ControlStreamContext::new(&context, false);
 		control_stream.start(
@@ -193,8 +193,8 @@ impl DesktopLaunchedSession {
 				video_handle: video_handle_for_resume,
 				sleep_inhibitor,
 			},
-			video_start_notify,
-			audio_start_notify,
+			video_start,
+			audio_start,
 		))
 	}
 }

@@ -68,13 +68,6 @@ fi
 
 BIN_SRC="${REPO_ROOT}/target/${PROFILE}/moonshine"
 
-# The pixelforge [patch] table points at .pixelforge-patch/, which must exist
-# before cargo parses the manifest. Materialize it if it's missing (fresh clone).
-if [[ ! -f "${REPO_ROOT}/.pixelforge-patch/Cargo.toml" ]]; then
-  echo ":: Preparing patched pixelforge sources"
-  "${REPO_ROOT}/dist/prepare-pixelforge.sh"
-fi
-
 echo ":: Building moonshine (${PROFILE})"
 # `debug` is cargo's default `dev` profile and has no flag; `release` does.
 CARGO_PROFILE_FLAG=()

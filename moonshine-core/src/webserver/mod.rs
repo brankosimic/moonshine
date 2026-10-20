@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
+	app_scanner::{ApplicationManager, ApplicationScannerConfig},
 	clients::ClientManager,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
@@ -86,7 +87,7 @@ pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
-	applications: Vec<ApplicationConfig>,
+	application_manager: ApplicationManager,
 	desktop_mode: DesktopMode,
 	unique_id: String,
 	client_manager: ClientManager,
@@ -106,6 +107,7 @@ impl Webserver {
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
+		application_scanners: Vec<ApplicationScannerConfig>,
 		desktop_mode: DesktopMode,
 		supported_codecs: u32,
 		hdr_supported: bool,
@@ -120,7 +122,7 @@ impl Webserver {
 			name,
 			rtsp_port,
 			webserver_config,
-			applications,
+			application_manager: ApplicationManager::new(applications, application_scanners),
 			desktop_mode,
 			unique_id,
 			client_manager,
@@ -432,7 +434,7 @@ impl Webserver {
 	}
 
 	async fn visible_applications(&self) -> Vec<ApplicationConfig> {
-		let mut applications = self.applications.clone();
+		let mut applications = self.application_manager.applications();
 		if !applications.iter().any(|a| a.desktop) && desktop_streaming::desktop_exposed(self.desktop_mode).await {
 			applications.push(desktop_streaming::desktop_application());
 		}
@@ -440,10 +442,11 @@ impl Webserver {
 	}
 
 	async fn application_by_id(&self, application_id: i32) -> Option<ApplicationConfig> {
-		if let Some(application) = self.applications.iter().find(|a| a.id() == application_id) {
-			return Some(application.clone());
+		if let Some(application) = self.application_manager.find(application_id) {
+			return Some(application);
 		}
-		if !self.applications.iter().any(|a| a.desktop) && desktop_streaming::desktop_exposed(self.desktop_mode).await {
+		let applications = self.application_manager.applications();
+		if !applications.iter().any(|a| a.desktop) && desktop_streaming::desktop_exposed(self.desktop_mode).await {
 			let desktop = desktop_streaming::desktop_application();
 			if desktop.id() == application_id {
 				return Some(desktop);
@@ -453,6 +456,9 @@ impl Webserver {
 	}
 
 	async fn app_list(&self) -> Response<Full<Bytes>> {
+		// Rescan so newly installed games show up without restarting moonshine.
+		self.application_manager.refresh().await;
+
 		let mut response = "<root status_code=\"200\">".to_string();
 		for application in self.visible_applications().await.iter() {
 			response += "<App>";
@@ -812,7 +818,7 @@ impl Webserver {
 			.remove("surroundAudioInfo")
 			.and_then(|s| s.parse().ok())
 			.unwrap_or(196610); // Default: stereo (0x30002)
-		let audio_channels = AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
+		let audio_channels = AudioChannels::from_wire_or_stereo((surround_audio_info & 0xFFFF) as u8);
 		let audio_channel_mask = surround_audio_info >> 16;
 
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -827,10 +833,11 @@ impl Webserver {
 			},
 		};
 
+		let desktop = application.desktop;
 		let initialize_result = self
 			.session_manager
 			.initialize_session(SessionContext {
-				application: application.clone(),
+				application,
 				application_id,
 				resolution: (width, height),
 				refresh_rate,
@@ -838,7 +845,7 @@ impl Webserver {
 				audio_channels,
 				audio_channel_mask,
 				hdr,
-				desktop: application.desktop,
+				desktop,
 			})
 			.await;
 
