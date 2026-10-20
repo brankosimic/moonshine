@@ -176,7 +176,7 @@ impl Desktop {
 		remote_desktop
 			.select_devices(
 				&session,
-				DeviceType::Keyboard | DeviceType::Pointer,
+				DeviceType::Keyboard | DeviceType::Pointer | DeviceType::Touchscreen,
 				None,
 				PersistMode::DoNot,
 			)
@@ -206,6 +206,9 @@ impl Desktop {
 		}
 		if !devices.contains(DeviceType::Pointer) {
 			tracing::warn!("Portal did not grant pointer input.");
+		}
+		if !devices.contains(DeviceType::Touchscreen) {
+			tracing::debug!("Portal did not grant touchscreen input.");
 		}
 		let stream_ref = selected
 			.streams()
@@ -802,11 +805,13 @@ async fn forward_input(
 				.await
 		},
 		DesktopInputEvent::MouseButtonDown { button } => {
+			tracing::debug!(button = *button, "Forwarding mouse button press to portal");
 			remote_desktop
 				.notify_pointer_button(session, *button as i32, KeyState::Pressed)
 				.await
 		},
 		DesktopInputEvent::MouseButtonUp { button } => {
+			tracing::debug!(button = *button, "Forwarding mouse button release to portal");
 			remote_desktop
 				.notify_pointer_button(session, *button as i32, KeyState::Released)
 				.await
@@ -835,12 +840,12 @@ async fn forward_input(
 		},
 		DesktopInputEvent::TouchUp { slot } => remote_desktop.notify_touch_up(session, *slot).await,
 		DesktopInputEvent::TouchCancelAll | DesktopInputEvent::Pen { .. } | DesktopInputEvent::TypeText { .. } => {
-			tracing::debug!(target: "input", "Ignoring unsupported portal input event: {event:?}");
+			tracing::debug!("Ignoring unsupported portal input event: {event:?}");
 			Ok(())
 		},
 	};
 	if let Err(e) = result {
-		tracing::debug!(target: "input", "Failed to forward input event to portal: {e}");
+		tracing::warn!("Failed to forward input event to portal: {e}");
 	}
 }
 #[cfg(test)]
