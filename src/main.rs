@@ -1,5 +1,5 @@
-use moonshine_core::desktop_streaming;
-use moonshine_core::healthcheck;
+use moonshine::desktop_streaming;
+use moonshine::healthcheck;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -10,13 +10,13 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-pub use moonshine_core::ShutdownReason;
-use moonshine_core::clients::ClientManager;
-use moonshine_core::config::Config;
-use moonshine_core::discovery::MdnsDiscovery;
-use moonshine_core::rtsp::RtspServer;
-use moonshine_core::session::manager::SessionManager;
-use moonshine_core::webserver::Webserver;
+use moonshine::ShutdownReason;
+use moonshine::clients::ClientManager;
+use moonshine::config::Config;
+use moonshine::discovery::MdnsDiscovery;
+use moonshine::rtsp::RtspServer;
+use moonshine::session::manager::SessionManager;
+use moonshine::webserver::Webserver;
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -205,7 +205,7 @@ impl Moonshine {
 		hdr_supported: bool,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
-		let (cert, pkey) = moonshine_core::tls::load_or_create_certificate(&config)?;
+		let (cert, pkey) = moonshine::tls::load_or_create_certificate(&config)?;
 
 		let session_manager = SessionManager::new(
 			config.compositor.clone(),

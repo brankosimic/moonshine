@@ -3,7 +3,7 @@ use crate::session::stream::DesktopMode;
 use std::env;
 use std::time::Duration;
 use tokio::runtime;
-const DESKTOP_BOXART: &[u8] = include_bytes!("../../assets/desktop-boxart.png");
+const DESKTOP_BOXART: &[u8] = include_bytes!("../assets/desktop-boxart.png");
 const KWIN_DBUS_NAME: &str = "org.kde.KWin";
 const PORTAL_DBUS_NAME: &str = "org.freedesktop.portal.Desktop";
 const KDE_PORTAL_DBUS_NAME: &str = "org.freedesktop.impl.portal.desktop.kde";
