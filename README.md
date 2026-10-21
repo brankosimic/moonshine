@@ -187,6 +187,16 @@ You can also pair from the command line:
 curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
+### Global pre/post commands
+
+A top-level `pre_command` runs before launching any application, whether it comes from a `[[application]]` entry or an application scanner. It is prepended to each application's own `pre_command`:
+
+```toml
+pre_command = [
+    ["/usr/bin/systemctl", "--user", "stop", "llama-server"],
+]
+```
+
 ### Adding applications
 
 Each application runs in its own isolated streaming session. Add them to `config.toml` like this:

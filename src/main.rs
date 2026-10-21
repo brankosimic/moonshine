@@ -238,6 +238,7 @@ impl Moonshine {
 				config.webserver.clone(),
 				config.applications.clone(),
 				config.application_scanners.clone(),
+				config.pre_command.clone(),
 				config.stream.desktop,
 				supported_codecs,
 				hdr_supported,
