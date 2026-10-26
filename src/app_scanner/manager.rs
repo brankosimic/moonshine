@@ -22,6 +22,8 @@ struct ApplicationManagerInner {
 	/// only the first one scans.
 	scanners: tokio::sync::Mutex<Vec<ApplicationScanner>>,
 
+	pre_command: Vec<Vec<String>>,
+
 	/// Configured and scanned applications as of the most recent scan.
 	applications: RwLock<Vec<ApplicationConfig>>,
 }
@@ -30,14 +32,19 @@ impl ApplicationManager {
 	/// Create a manager and run the first scan.
 	///
 	/// Blocks while scanning, so call it before serving requests.
-	pub fn new(configured_applications: Vec<ApplicationConfig>, scanners: Vec<ApplicationScannerConfig>) -> Self {
+	pub fn new(
+		configured_applications: Vec<ApplicationConfig>,
+		scanners: Vec<ApplicationScannerConfig>,
+		pre_command: Vec<Vec<String>>,
+	) -> Self {
 		let mut scanners: Vec<ApplicationScanner> = scanners.into_iter().map(ApplicationScanner::new).collect();
-		let applications = load_applications(&configured_applications, &mut scanners);
+		let applications = load_applications(&configured_applications, &mut scanners, &pre_command);
 
 		Self {
 			inner: Arc::new(ApplicationManagerInner {
 				configured_applications,
 				scanners: tokio::sync::Mutex::new(scanners),
+				pre_command,
 				applications: RwLock::new(applications),
 			}),
 		}
@@ -54,9 +61,10 @@ impl ApplicationManager {
 		}
 
 		let configured_applications = self.inner.configured_applications.clone();
+		let pre_command = self.inner.pre_command.clone();
 		let mut scanned = scanners.clone();
 		match tokio::task::spawn_blocking(move || {
-			let applications = load_applications(&configured_applications, &mut scanned);
+			let applications = load_applications(&configured_applications, &mut scanned, &pre_command);
 			(applications, scanned)
 		})
 		.await
@@ -134,7 +142,11 @@ mod tests {
 		let tempdir = tempdir().unwrap();
 		write_desktop_entry(tempdir.path(), "a.desktop", "Alpha");
 
-		let manager = ApplicationManager::new(Vec::new(), vec![desktop_scanner(tempdir.path().to_path_buf())]);
+		let manager = ApplicationManager::new(
+			Vec::new(),
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			Vec::new(),
+		);
 		assert_eq!(titles(&manager), ["Alpha"]);
 
 		sleep(Duration::from_millis(10));
@@ -153,7 +165,11 @@ mod tests {
 		let tempdir = tempdir().unwrap();
 		write_desktop_entry(tempdir.path(), "a.desktop", "Alpha");
 
-		let manager = ApplicationManager::new(Vec::new(), vec![desktop_scanner(tempdir.path().to_path_buf())]);
+		let manager = ApplicationManager::new(
+			Vec::new(),
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			Vec::new(),
+		);
 		let alpha = manager.applications().remove(0);
 
 		assert_eq!(manager.find(alpha.id()).map(|app| app.title), Some("Alpha".to_string()));
@@ -169,7 +185,11 @@ mod tests {
 			title: "Manual".to_string(),
 			..Default::default()
 		};
-		let manager = ApplicationManager::new(vec![configured], vec![desktop_scanner(tempdir.path().to_path_buf())]);
+		let manager = ApplicationManager::new(
+			vec![configured],
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			Vec::new(),
+		);
 
 		sleep(Duration::from_millis(10));
 		write_desktop_entry(tempdir.path(), "b.desktop", "Beta");

@@ -36,6 +36,9 @@ pub struct Config {
 	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_command: Vec<Vec<String>>,
+
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
 
@@ -133,6 +136,7 @@ impl Default for Config {
 				stderr: None,
 				launch_timeout_secs: 2,
 			})],
+			pre_command: Vec::new(),
 			compositor: CompositorConfig::default(),
 			inhibit_sleep: true,
 		}

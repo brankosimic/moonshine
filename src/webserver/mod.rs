@@ -36,7 +36,9 @@ use crate::{
 
 use self::pairing::handle_pair_request;
 
+use super::session::stream::DesktopMode;
 use super::session::stream::audio::AudioChannels;
+use crate::desktop_streaming;
 
 mod pairing;
 
@@ -86,6 +88,7 @@ pub struct Webserver {
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
 	application_manager: ApplicationManager,
+	desktop_mode: DesktopMode,
 	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
@@ -105,6 +108,8 @@ impl Webserver {
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
 		application_scanners: Vec<ApplicationScannerConfig>,
+		pre_command: Vec<Vec<String>>,
+		desktop_mode: DesktopMode,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		unique_id: String,
@@ -118,7 +123,8 @@ impl Webserver {
 			name,
 			rtsp_port,
 			webserver_config,
-			application_manager: ApplicationManager::new(applications, application_scanners),
+			application_manager: ApplicationManager::new(applications, application_scanners, pre_command),
+			desktop_mode,
 			unique_id,
 			client_manager,
 			session_manager,
@@ -344,7 +350,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.app_asset(params)
+					self.app_asset(params).await
 				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
@@ -428,12 +434,34 @@ impl Webserver {
 		Ok(response)
 	}
 
+	async fn visible_applications(&self) -> Vec<ApplicationConfig> {
+		let mut applications = self.application_manager.applications();
+		if !applications.iter().any(|a| a.desktop) && desktop_streaming::desktop_exposed(self.desktop_mode).await {
+			applications.push(desktop_streaming::desktop_application());
+		}
+		applications
+	}
+
+	async fn application_by_id(&self, application_id: i32) -> Option<ApplicationConfig> {
+		if let Some(application) = self.application_manager.find(application_id) {
+			return Some(application);
+		}
+		let applications = self.application_manager.applications();
+		if !applications.iter().any(|a| a.desktop) && desktop_streaming::desktop_exposed(self.desktop_mode).await {
+			let desktop = desktop_streaming::desktop_application();
+			if desktop.id() == application_id {
+				return Some(desktop);
+			}
+		}
+		None
+	}
+
 	async fn app_list(&self) -> Response<Full<Bytes>> {
 		// Rescan so newly installed games show up without restarting moonshine.
 		self.application_manager.refresh().await;
 
 		let mut response = "<root status_code=\"200\">".to_string();
-		for application in self.application_manager.applications().iter() {
+		for application in self.visible_applications().await.iter() {
 			response += "<App>";
 
 			let hdr_supported = u8::from(self.hdr_supported);
@@ -453,7 +481,7 @@ impl Webserver {
 		response
 	}
 
-	fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
 			None => {
@@ -471,7 +499,7 @@ impl Webserver {
 			},
 		};
 
-		let application = match self.application_manager.find(application_id) {
+		let application = match self.application_by_id(application_id).await {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -578,7 +606,7 @@ impl Webserver {
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
 		response += &format!("<HttpsPort>{}</HttpsPort>", self.webserver_config.port_https);
-		response += &format!("<ExternalPort>{}</ExternalPort>", self.webserver_config.port);
+		response += &format!("<ExternalPort>{}</ExternalPort>", self.rtsp_port);
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += &format!("<LocalIP>{}</LocalIP>", escape_xml(local_ip));
@@ -797,7 +825,7 @@ impl Webserver {
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
 		let hdr = hdr_mode != 0;
 
-		let application = match self.application_manager.find(application_id) {
+		let application = match self.application_by_id(application_id).await {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -806,6 +834,7 @@ impl Webserver {
 			},
 		};
 
+		let desktop = application.desktop;
 		let initialize_result = self
 			.session_manager
 			.initialize_session(SessionContext {
@@ -817,6 +846,7 @@ impl Webserver {
 				audio_channels,
 				audio_channel_mask,
 				hdr,
+				desktop,
 			})
 			.await;
 

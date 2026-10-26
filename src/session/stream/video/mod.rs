@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{StartSignal, StartWaiter};
@@ -16,6 +15,7 @@ mod packetizer;
 mod pipeline;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
+pub(crate) use pipeline::FrameSource;
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
@@ -219,6 +219,9 @@ pub struct VideoStreamContext {
 
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,
+
+	/// Whether this is a desktop (portal capture) session.
+	pub desktop_mode: bool,
 }
 
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
@@ -279,7 +282,7 @@ impl VideoStreamHandle {
 
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
-	frames: CompositorFrames,
+	frames: FrameSource,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 }
@@ -288,7 +291,7 @@ impl VideoStream {
 	pub async fn new(
 		config: VideoStreamConfig,
 		address: String,
-		frames: CompositorFrames,
+		frames: FrameSource,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,

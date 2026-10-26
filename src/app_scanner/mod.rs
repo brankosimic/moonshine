@@ -209,11 +209,20 @@ fn unique_title(title: &str, used: &mut HashSet<String>) -> String {
 pub(crate) fn load_applications(
 	configured_applications: &[ApplicationConfig],
 	application_scanners: &mut [ApplicationScanner],
+	pre_command: &[Vec<String>],
 ) -> Vec<ApplicationConfig> {
 	let mut applications = configured_applications.to_vec();
 	let scanned_applications = scan_applications(application_scanners, configured_applications);
 	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
 	applications.extend(scanned_applications);
+	if !pre_command.is_empty() {
+		for application in &mut applications {
+			let mut merged = Vec::with_capacity(pre_command.len() + application.pre_command.len());
+			merged.extend_from_slice(pre_command);
+			merged.append(&mut application.pre_command);
+			application.pre_command = merged;
+		}
+	}
 	resolve_missing_boxart(&mut applications);
 	applications
 }
@@ -344,5 +353,30 @@ mod tests {
 		let mut scanners = vec![lutris_scanner(db)];
 		assert!(scan_applications(&mut scanners, &[]).is_empty());
 		assert!(scanners[0].needs_reload());
+	}
+
+	#[test]
+	fn global_pre_commands_are_prepended_to_every_application() {
+		let tempdir = tempdir().unwrap();
+		write_desktop_entry(tempdir.path(), "game.desktop", "game");
+
+		let configured = ApplicationConfig {
+			title: "Manual".to_string(),
+			pre_command: vec![vec!["/bin/own".to_string()]],
+			..Default::default()
+		};
+		let mut scanners = vec![desktop_scanner(tempdir.path().to_path_buf())];
+		let global = vec![vec!["/bin/global".to_string()]];
+
+		let applications = load_applications(&[configured], &mut scanners, &global);
+
+		let manual = applications.iter().find(|app| app.title == "Manual").unwrap();
+		assert_eq!(
+			manual.pre_command,
+			vec![vec!["/bin/global".to_string()], vec!["/bin/own".to_string()]]
+		);
+
+		let scanned = applications.iter().find(|app| app.title == "Game").unwrap();
+		assert_eq!(scanned.pre_command, vec![vec!["/bin/global".to_string()]]);
 	}
 }
