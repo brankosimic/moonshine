@@ -135,6 +135,7 @@ impl Default for Config {
 				stdout: None,
 				stderr: None,
 				launch_timeout_secs: 2,
+				env: Default::default(),
 			})],
 			pre_command: Vec::new(),
 			compositor: CompositorConfig::default(),

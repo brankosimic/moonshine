@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use pixelforge::{Codec, EncodeBitDepth, PixelFormat, VideoContext, VideoContextBuilder};
 
 use crate::config::Config;
+use crate::session::stream::video::KcmpProbe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -199,7 +200,7 @@ pub fn print_health_report(report: &HealthReport) {
 
 /// Probe GPU capabilities and HDR support without the full health check.
 ///
-/// Runs the render-node, EGL, Vulkan, codec and DMA-BUF probes and records
+/// Runs the render-node, renderer, Vulkan, codec and DMA-BUF probes and records
 /// their results. This is the value-producing part of [`run_healthcheck`] and
 /// is invoked unconditionally so the server always advertises real capabilities.
 pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
@@ -230,8 +231,8 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	let render_node = check_render_nodes(report, gpu_config);
 	let render_node_open = check_render_node_open(report, gpu_config, render_node.as_ref());
 	// Prefer the configured/accessible node over the first discovered one, so
-	// the EGL probe (HDR detection) runs on the GPU the compositor will use.
-	let egl_result = check_egl(report, render_node_open.as_ref().or(render_node.as_ref()));
+	// the renderer probe (HDR detection) runs on the GPU the compositor will use.
+	let renderer_result = check_renderer(report, render_node_open.as_ref().or(render_node.as_ref()));
 	let vk_context = check_vulkan(report);
 	check_codecs(report, vk_context.as_ref());
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
@@ -243,11 +244,11 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 			.to_string_lossy()
 			.to_string();
 		report.gpu_name = name;
-	} else if let Some((ref name, _, _)) = egl_result {
+	} else if let Some((ref name, _, _)) = renderer_result {
 		report.gpu_name = name.clone();
 	}
 
-	if let Some((_, hdr, _)) = &egl_result {
+	if let Some((_, hdr, _)) = &renderer_result {
 		report.hdr_supported = *hdr;
 	}
 }
@@ -468,94 +469,93 @@ fn check_render_node_open(
 	}
 }
 
-fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(String, bool, Vec<String>)> {
+/// Create the compositor's renderer (smithay's Vulkan renderer, as ferriscope
+/// does) on `node` and report its queue and render formats.
+///
+/// Returns the GPU name, whether the renderer can draw into an HDR format, and
+/// the renderable format names.
+fn check_renderer(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(String, bool, Vec<String>)> {
+	use smithay::backend::{
+		allocator::{Fourcc, dmabuf::Dmabuf},
+		drm::{DrmDeviceFd, DrmNode},
+		renderer::{Bind, vulkan::VulkanRenderer},
+		vulkan::{Instance, PhysicalDevice, version::Version},
+	};
+
+	const NAME: &str = "Renderer";
 	let start = Instant::now();
 	let node = node?;
+	let fail = |report: &mut HealthReport, message: String| {
+		report.add_failed(NAME, message, start.elapsed().as_millis() as u64);
+		None
+	};
 
 	let render_fd = match std::fs::OpenOptions::new().read(true).write(true).open(node) {
 		Ok(fd) => fd,
-		Err(e) => {
-			report.add_failed(
-				"EGL/GLES",
-				format!("  Cannot open render node for EGL probe: {e}"),
-				start.elapsed().as_millis() as u64,
-			);
-			return None;
-		},
+		Err(e) => return fail(report, format!("  Cannot open render node for the renderer probe: {e}")),
 	};
-
-	let gbm_device = match smithay::backend::allocator::gbm::GbmDevice::new(render_fd) {
-		Ok(d) => d,
+	let drm_node = match render_fd
+		.metadata()
+		.map_err(|e| e.to_string())
+		.and_then(|meta| DrmNode::from_dev_id(meta.st_rdev()).map_err(|e| e.to_string()))
+	{
+		Ok(drm_node) => drm_node,
+		Err(e) => return fail(report, format!("  {} is not a DRM node: {e}", node.display())),
+	};
+	let instance = match Instance::new(Version::VERSION_1_3, None) {
+		Ok(instance) => instance,
+		Err(e) => return fail(report, format!("  Failed to create a Vulkan instance: {e:?}")),
+	};
+	let phd = match PhysicalDevice::enumerate(&instance) {
+		Ok(mut devices) => devices.find(|phd| {
+			phd.render_node().ok().flatten() == Some(drm_node) || phd.primary_node().ok().flatten() == Some(drm_node)
+		}),
+		Err(e) => return fail(report, format!("  Failed to enumerate Vulkan devices: {e:?}")),
+	};
+	let Some(phd) = phd else {
+		return fail(report, format!("  No Vulkan device for {}", node.display()));
+	};
+	let drm = DrmDeviceFd::new(smithay::utils::DeviceFd::from(OwnedFd::from(render_fd)));
+	let renderer = match VulkanRenderer::new(&phd, Some(drm)) {
+		Ok(renderer) => renderer,
 		Err(e) => {
-			report.add_failed(
-				"EGL/GLES",
+			return fail(
+				report,
 				format!(
-					"  Failed to create GBM device: {e}\n  libgbm is required for GPU rendering.\n  Ubuntu: `sudo apt install libgbm1`\n  Fedora: `sudo dnf install mesa-libgbm`\n  Arch: `sudo pacman -S mesa`"
+					"  Failed to create the Vulkan renderer: {e:?}\n  The compositor needs Vulkan 1.3 with VK_EXT_image_drm_format_modifier, push descriptors and storage images without format."
 				),
-				start.elapsed().as_millis() as u64,
 			);
-			return None;
 		},
 	};
 
-	let egl_display = match unsafe { smithay::backend::egl::EGLDisplay::new(gbm_device) } {
-		Ok(d) => d,
-		Err(e) => {
-			report.add_failed(
-				"EGL/GLES",
-				format!(
-					"  Failed to create EGL display: {e}\n  GPU drivers may be missing or incomplete.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install mesa-libEGL`\n  Arch: `sudo pacman -S mesa`"
-				),
-				start.elapsed().as_millis() as u64,
-			);
-			return None;
-		},
-	};
-
-	let egl_context = match smithay::backend::egl::EGLContext::new(&egl_display) {
-		Ok(c) => c,
-		Err(e) => {
-			report.add_failed(
-				"EGL/GLES",
-				format!("  Failed to create EGL context: {e}\n  GPU does not support the required OpenGL ES features."),
-				start.elapsed().as_millis() as u64,
-			);
-			return None;
-		},
-	};
-
-	let render_formats = egl_context.dmabuf_render_formats();
+	let render_formats = Bind::<Dmabuf>::supported_formats(&renderer).unwrap_or_default();
 	let mut format_names: Vec<String> = render_formats.iter().map(|f| format!("{:?}", f.code)).collect();
 	format_names.sort();
 	format_names.dedup();
+	// The formats ferriscope picks for HDR output (`pick_hdr_format`).
 	let hdr_supported = render_formats.iter().any(|f| {
 		matches!(
 			f.code,
-			smithay::backend::allocator::Fourcc::Abgr2101010 | smithay::backend::allocator::Fourcc::Abgr16161616f
+			Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 | Fourcc::Abgr16161616f | Fourcc::Xbgr16161616f
 		)
 	});
 
-	// Try to derive a GPU name from the render node's uevent DRIVER= field,
-	// falling back to the render node path when unavailable.
-	let gpu_name = node
-		.file_name()
-		.and_then(|n| n.to_str())
-		.map(|name| Path::new("/sys/class/drm").join(name).join("device/uevent"))
-		.and_then(|uevent| std::fs::read_to_string(&uevent).ok())
-		.and_then(|uevent| {
-			uevent
-				.lines()
-				.find_map(|line| line.strip_prefix("DRIVER=").map(|d| d.to_string()))
-		})
-		.unwrap_or_else(|| node.display().to_string());
-
-	let msg = if hdr_supported {
-		format!("{gpu_name} (HDR-capable, formats: {})", format_names.join(", "))
+	let gpu_name = phd.name().to_string();
+	let queue = if renderer.is_dedicated_compute_queue() {
+		format!("compute-only queue family {}", renderer.queue_family_index())
 	} else {
-		format!("{gpu_name} (SDR-only, formats: {})", format_names.join(", "))
+		format!(
+			"queue family {} (no compute-only family)",
+			renderer.queue_family_index()
+		)
 	};
+	let msg = format!(
+		"{gpu_name}, {queue} ({}, formats: {})",
+		if hdr_supported { "HDR-capable" } else { "SDR-only" },
+		format_names.join(", ")
+	);
 
-	report.add_passed("EGL/GLES", msg, start.elapsed().as_millis() as u64);
+	report.add_passed(NAME, msg, start.elapsed().as_millis() as u64);
 	Some((gpu_name, hdr_supported, format_names))
 }
 
@@ -919,59 +919,50 @@ fn check_inhibit(report: &mut HealthReport) {
 }
 
 fn check_kcmp(report: &mut HealthReport) {
+	/// Explains the fallback when `kcmp(2)` is unavailable.
+	const FALLBACK: &str = "  The DMA-BUF import cache compares inode numbers instead (needs Linux 5.3 or later).";
+
 	let start = Instant::now();
+	let probe = KcmpProbe::get();
+	let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-	/// `KCMP_FILE` — not exposed by `libc` or glibc.
-	const KCMP_FILE: libc::c_int = 0;
-
-	// SAFETY: uses /dev/null fds; syscall with scalar arguments.
-	let result = unsafe {
-		let a = std::fs::File::open("/dev/null");
-		let b = std::fs::File::open("/dev/null");
-		match (a, b) {
-			(Ok(a), Ok(b)) => libc::syscall(
-				libc::SYS_kcmp,
-				libc::getpid(),
-				libc::getpid(),
-				KCMP_FILE,
-				a.as_raw_fd() as libc::c_ulong,
-				b.as_raw_fd() as libc::c_ulong,
-			),
-			(Err(e), _) | (_, Err(e)) => {
-				report.add_failed(
-					"kcmp(2)",
-					format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
-					start.elapsed().as_millis() as u64,
-				);
-				return;
-			},
-		}
+	let error = match probe {
+		KcmpProbe::Available => {
+			report.add_passed("kcmp(2)", "Available".into(), duration_ms);
+			return;
+		},
+		KcmpProbe::NoProbeFile(e) => {
+			report.add_failed(
+				"kcmp(2)",
+				format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
+				duration_ms,
+			);
+			return;
+		},
+		KcmpProbe::Unavailable(error) => error,
 	};
 
-	if result < 0 {
-		let error = std::io::Error::last_os_error();
-		let hint = match error.raw_os_error() {
-			Some(libc::ENOSYS) => {
-				"  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n  \
-				kcmp(2) is required for DMA-BUF import cache validation.\n  \
-				Rebuild your kernel with CONFIG_CHECKPOINT_RESTORE=y."
-			},
-			Some(libc::EPERM) => {
-				"  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n  \
-				kcmp(2) is required for DMA-BUF import cache validation.\n  \
-				Run outside the sandbox or adjust the seccomp profile."
-			},
-			_ => "  kcmp(2) is required for DMA-BUF import cache validation.",
-		};
-		report.add_failed(
+	match error.raw_os_error() {
+		Some(libc::ENOSYS) => report.add_warn(
 			"kcmp(2)",
-			format!("  kcmp(2) not available: {error}\n{hint}"),
-			start.elapsed().as_millis() as u64,
-		);
-		return;
+			format!(
+				"  kcmp(2) not available: {error}\n  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n{FALLBACK}"
+			),
+			duration_ms,
+		),
+		Some(libc::EPERM) => report.add_warn(
+			"kcmp(2)",
+			format!(
+				"  kcmp(2) not available: {error}\n  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n{FALLBACK}"
+			),
+			duration_ms,
+		),
+		_ => report.add_failed(
+			"kcmp(2)",
+			format!("  kcmp(2) not available: {error}\n  kcmp(2) is required for DMA-BUF import cache validation."),
+			duration_ms,
+		),
 	}
-
-	report.add_passed("kcmp(2)", "Available".into(), start.elapsed().as_millis() as u64);
 }
 
 // ---------------------------------------------------------------------------

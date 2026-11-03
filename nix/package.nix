@@ -14,6 +14,7 @@
   vulkan-loader,
   wayland,
   libglvnd,
+  shaderc,
 }:
 
 let
@@ -126,15 +127,6 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     allowBuiltinFetchGit = true;
-    outputHashes = {
-      # Exception: ash's pinned rev sits on an unmerged PR branch, unreachable
-      # from any ref, so the builtin git fetcher (which only fetches refs)
-      # cannot get it and this fixed hash is needed. If the ash pin changes
-      # this fails loudly: a rev bump prints the correct new hash in the
-      # mismatch error, and once the pin moves to a rev on a normal branch or
-      # tag this entry can simply be deleted.
-      "ash-0.38.0+1.4.329" = "sha256-apzc//AZqS3F4e4Epm3Dl20ZkkMKUvLjyxv7ZwJh1Jw=";
-    };
   };
 
   # The inputtino graft described above. The cargo setup hook has already
@@ -175,6 +167,12 @@ rustPlatform.buildRustPackage {
     vulkan-loader
     wayland
   ];
+
+  # smithay's Vulkan renderer (pulled in for ferriscope) compiles its shaders
+  # with shaderc at build time. Without a system library shaderc-sys falls
+  # back to building it from source, which needs git and network access, so
+  # point it at nixpkgs'.
+  env.SHADERC_LIB_DIR = "${lib.getLib shaderc}/lib";
 
   # The tests exercise the compositor/encoder paths and expect devices
   # (GPU, uinput) that the build sandbox does not have.

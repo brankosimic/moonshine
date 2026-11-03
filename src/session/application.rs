@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -59,6 +59,11 @@ pub struct ApplicationConfig {
 	/// windows can take focus. Games from the Steam scanner have it on.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub steam_integration: bool,
+
+	/// Extra environment variables for the application. They override the
+	/// variables Moonshine sets, such as `DISPLAY`.
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub env: BTreeMap<String, String>,
 }
 
 impl Default for ApplicationConfig {
@@ -74,6 +79,7 @@ impl Default for ApplicationConfig {
 			launch_timeout_secs: default_launch_timeout(),
 			desktop: false,
 			steam_integration: false,
+			env: BTreeMap::new(),
 		}
 	}
 }
@@ -163,7 +169,7 @@ impl Application {
 			return Err(());
 		};
 		let args = &config.command[1..];
-		let envs = make_envs(&context)?;
+		let envs = make_envs(&context, &config.env)?;
 
 		tracing::info!(program, ?args, "Launching application.");
 
@@ -234,7 +240,7 @@ fn is_plasma_session(program: &str) -> bool {
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
+fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>) -> Result<Vec<String>, ()> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -258,6 +264,11 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 	}
 
 	for (key, value) in &context.extra_env {
+		envs.push(format!("{key}={value}"));
+	}
+
+	// The application's own variables come last, so systemd lets them win.
+	for (key, value) in config_env {
 		envs.push(format!("{key}={value}"));
 	}
 
@@ -783,7 +794,9 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::{ApplicationConfig, is_plasma_session, split_standard_io};
+	use super::{ApplicationConfig, ApplicationContext, is_plasma_session, make_envs, split_standard_io};
+	use std::collections::{BTreeMap, HashMap};
+	use std::path::PathBuf;
 
 	#[test]
 	fn test_steam_integration_defaults_to_off() {
@@ -863,5 +876,40 @@ mod tests {
 		assert!(!is_plasma_session("/usr/bin/wine"));
 		assert!(!is_plasma_session("/usr/bin/xdg-open"));
 		assert!(!is_plasma_session("cosmic-session"));
+	}
+
+	fn test_context() -> ApplicationContext {
+		ApplicationContext {
+			unit_name: "moonshine-session.service".to_string(),
+			pulse_socket_path: PathBuf::from("/run/user/1000/moonshine/pulse/native"),
+			xdisplay: 0,
+			wayland_display: "wayland-1".to_string(),
+			compositor_env: Vec::new(),
+			extra_env: HashMap::new(),
+		}
+	}
+
+	#[test]
+	fn application_env_comes_after_the_moonshine_variables() {
+		let env = BTreeMap::from([("COSMIC_BACKEND".to_string(), "winit".to_string())]);
+
+		let envs = make_envs(&test_context(), &env).unwrap();
+
+		assert_eq!(envs.last().map(String::as_str), Some("COSMIC_BACKEND=winit"));
+		assert!(envs.contains(&"DISPLAY=:0".to_string()));
+	}
+
+	#[test]
+	fn application_env_is_read_from_toml() {
+		let config: ApplicationConfig = toml::from_str(
+			r#"
+			title = "COSMIC"
+			command = ["/usr/bin/start-cosmic"]
+			env = { COSMIC_BACKEND = "winit" }
+			"#,
+		)
+		.unwrap();
+
+		assert_eq!(config.env.get("COSMIC_BACKEND").map(String::as_str), Some("winit"));
 	}
 }

@@ -103,6 +103,7 @@ pub fn desktop_application() -> ApplicationConfig {
 		launch_timeout_secs: 2,
 		desktop: true,
 		steam_integration: false,
+		env: Default::default(),
 	}
 }
 pub fn inject_desktop_app(config: &mut crate::config::Config) {
