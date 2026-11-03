@@ -11,6 +11,7 @@ use crate::session::stream::audio::AudioStream;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
+use crate::session::stream::video::FrameSource;
 use crate::session::stream::video::FrameStats;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
@@ -29,6 +30,8 @@ use self::stream::video::VideoStreamConfig;
 
 pub mod application;
 pub mod compositor;
+pub mod desktop;
+pub mod desktop_session;
 pub mod inhibit;
 pub mod manager;
 pub mod stream;
@@ -102,28 +105,40 @@ pub struct SessionContext {
 
 	/// If true, the compositor will be launched with HDR support.
 	pub hdr: bool,
+
+	/// Whether this is a desktop (screen capture) session.
+	pub desktop: bool,
 }
 
 /// The state of the session. This enum enforces the session lifecycle:
 ///
-/// 1. `Initialized` — Session created; compositor and app not yet started.
-/// 2. `Launched` — Compositor and app are running; waiting for RTSP negotiation.
-/// 3. `Active` — Streams are active.
+/// 1. `Initialized` / `DesktopInitialized` — Session created; compositor/app or desktop capture not yet started.
+/// 2. `Launched` / `DesktopLaunched` — Components running; waiting for RTSP negotiation.
+/// 3. `Active` / `DesktopActive` — Streams are active.
 enum SessionState {
 	/// Session initialized; compositor and app not yet started.
 	Initialized(InitializedSession),
+	/// Desktop initialized; desktop capture portal not yet started.
+	DesktopInitialized(desktop_session::DesktopInitializedSession),
 	/// Compositor and app launched; waiting for RTSP PLAY.
 	Launched(LaunchedSession),
+	/// Desktop capture launched; waiting for RTSP PLAY.
+	DesktopLaunched(desktop_session::DesktopLaunchedSession),
 	/// Streams active.
 	Active(ActiveSession),
+	/// Desktop streams active.
+	DesktopActive(desktop_session::DesktopActiveSession),
 }
 
 impl SessionState {
 	fn context(&self) -> &SessionContext {
 		match self {
-			Self::Initialized(session) => session.context(),
-			Self::Launched(launched) => launched.context(),
-			Self::Active(active) => active.context(),
+			Self::Initialized(s) => s.context(),
+			Self::DesktopInitialized(s) => s.context(),
+			Self::Launched(s) => s.context(),
+			Self::DesktopLaunched(s) => s.context(),
+			Self::Active(s) => s.context(),
+			Self::DesktopActive(s) => s.context(),
 		}
 	}
 }
@@ -160,13 +175,18 @@ impl InitializedSession {
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
-			handles.frames,
+			FrameSource::Game(handles.frames),
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
 		)
 		.await?;
-		let control_stream = ControlStream::new(control_config, address, handles.input, stop.clone())?;
+		let control_stream = ControlStream::new(
+			control_config,
+			address,
+			stream::control::input::ControlInputSink::Game(handles.input),
+			stop.clone(),
+		)?;
 
 		Ok(Self {
 			context,
