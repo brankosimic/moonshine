@@ -15,6 +15,7 @@
 #   --user USER   Service instance to restart (default: current user)
 #   --no-restart  Install without restarting the service
 #   --debug       Build the debug profile instead of release
+#   --non-interactive  Never prompt for a sudo password (needs NOPASSWD sudo)
 #   --help        Show this message
 #
 set -euo pipefail
@@ -24,9 +25,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESTART=true
 PROFILE="release"
 TARGET_USER=""
+NONINTERACTIVE=false
+SUDO=(sudo)
 
 print_help() {
-  sed -n '3,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -35,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --user) TARGET_USER="$2"; shift 2 ;;
     --no-restart) RESTART=false; shift ;;
     --debug) PROFILE="debug"; shift ;;
+    --non-interactive) NONINTERACTIVE=true; shift ;;
     --help|-h) print_help ;;
     *) echo "unknown option: $1" >&2; print_help ;;
   esac
@@ -48,6 +52,14 @@ fi
 if ! command -v sudo &>/dev/null; then
   echo "sudo not found" >&2
   exit 1
+fi
+
+if $NONINTERACTIVE; then
+  SUDO=(sudo -n)
+  if ! sudo -n /usr/bin/systemctl daemon-reload 2>/dev/null; then
+    echo "sudo requires a password; --non-interactive needs NOPASSWD for the install commands" >&2
+    exit 1
+  fi
 fi
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
@@ -89,39 +101,40 @@ echo "   ${BIN_SRC}"
 # Destination paths mirror nfpm.yaml: the shipped moonshine@.service hardcodes
 # /usr/bin/start-moonshine.sh. (The old WSI Vulkan layer is gone — upstream
 # replaced moonshine-wsi with ferriscope, so there is no layer to install.)
-INSTALL_CMDS=(
-  "install -Dm755 '${BIN_SRC}' /usr/bin/moonshine"
-  "install -Dm755 '${REPO_ROOT}/dist/start-moonshine.sh' /usr/bin/start-moonshine.sh"
-  "install -Dm644 '${REPO_ROOT}/dist/moonshine@.service' /usr/lib/systemd/system/moonshine@.service"
-  "install -Dm644 '${REPO_ROOT}/dist/60-moonshine.rules' /usr/lib/udev/rules.d/60-moonshine.rules"
-  "install -Dm644 '${REPO_ROOT}/dist/moonshine-modules.conf' /usr/lib/modules-load.d/moonshine.conf"
-  "install -Dm644 '${REPO_ROOT}/dist/moonshine-sysusers.conf' /usr/lib/sysusers.d/moonshine.conf"
-  "install -Dm644 '${REPO_ROOT}/dist/50-moonshine-inhibit-sleep.rules' /usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules"
-  "install -Dm644 '${REPO_ROOT}/LICENSE' /usr/share/licenses/moonshine/LICENSE"
-  "systemctl daemon-reload"
-  # Creates the 'moonshine' group referenced by the sleep-inhibit polkit rule.
-  "systemd-sysusers || true"
-  "udevadm control --reload || true"
-  "udevadm trigger || true"
-  # Virtual input backends used by inputtino, so no reboot is needed.
-  "modprobe uinput || true"
-  "modprobe uhid || true"
-  "systemctl reload-or-restart polkit.service || true"
-)
+echo ":: Installing (sudo)"
+echo ""
+
+run_root() {
+  printf '  %s\n' "$*"
+  "${SUDO[@]}" "$@"
+}
+
+run_root_optional() {
+  printf '  %s\n' "$*"
+  "${SUDO[@]}" "$@" || true
+}
+
+run_root /usr/bin/install -Dm755 "$BIN_SRC" /usr/bin/moonshine
+run_root /usr/bin/install -Dm755 "$REPO_ROOT/dist/start-moonshine.sh" /usr/bin/start-moonshine.sh
+run_root /usr/bin/install -Dm644 "$REPO_ROOT/dist/moonshine@.service" /usr/lib/systemd/system/moonshine@.service
+run_root /usr/bin/install -Dm644 "$REPO_ROOT/dist/60-moonshine.rules" /usr/lib/udev/rules.d/60-moonshine.rules
+run_root /usr/bin/install -Dm644 "$REPO_ROOT/dist/moonshine-modules.conf" /usr/lib/modules-load.d/moonshine.conf
+run_root /usr/bin/install -Dm644 "$REPO_ROOT/dist/moonshine-sysusers.conf" /usr/lib/sysusers.d/moonshine.conf
+run_root /usr/bin/install -Dm644 "$REPO_ROOT/dist/50-moonshine-inhibit-sleep.rules" /usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
+run_root /usr/bin/install -Dm644 "$REPO_ROOT/LICENSE" /usr/share/licenses/moonshine/LICENSE
+run_root /usr/bin/systemctl daemon-reload
+# Creates the 'moonshine' group referenced by the sleep-inhibit polkit rule.
+run_root_optional /usr/bin/systemd-sysusers
+run_root_optional /usr/bin/udevadm control --reload
+run_root_optional /usr/bin/udevadm trigger
+# Virtual input backends used by inputtino, so no reboot is needed.
+run_root_optional /usr/bin/modprobe uinput
+run_root_optional /usr/bin/modprobe uhid
+run_root_optional /usr/bin/systemctl reload-or-restart polkit.service
 
 if $RESTART; then
-  INSTALL_CMDS+=("systemctl restart 'moonshine@${TARGET_USER}'")
+  run_root /usr/bin/systemctl restart "moonshine@${TARGET_USER}"
 fi
-
-echo ""
-echo ":: The following commands will be run with sudo:"
-echo ""
-for cmd in "${INSTALL_CMDS[@]}"; do
-  echo "  $cmd"
-done
-echo ""
-
-sudo bash -c "$(printf '%s\n' "${INSTALL_CMDS[@]}")"
 
 echo ""
 echo "moonshine ${PROFILE} build installed"
