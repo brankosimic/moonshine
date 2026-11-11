@@ -451,6 +451,7 @@ impl RtspServer {
 			max_reference_frames,
 			full_range,
 			encrypt_video: self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
+			desktop_mode: false,
 		};
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
@@ -505,6 +506,7 @@ impl RtspServer {
 			qos: audio_qos_type != "0",
 			audio_config,
 			encrypt_audio: client_encryption_flags & EncryptionFlags::Audio as u8 != 0,
+			desktop: false,
 		};
 
 		if self
@@ -598,11 +600,28 @@ impl RtspServer {
 					.map_err(|e| tracing::warn!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
-					Method::Announce => self.handle_announce_request(request, cseq).await,
+					Method::Announce | Method::Setup | Method::Play => {
+						match self.session_manager.get_session_context().await {
+							Ok(Some(_)) => {},
+							_ => {
+								tracing::warn!(
+									"Rejected RTSP {:?} request from {}: no active session",
+									request.method(),
+									address
+								);
+								return Ok(());
+							},
+						}
+
+						match request.method() {
+							Method::Announce => self.handle_announce_request(request, cseq).await,
+							Method::Setup => self.handle_setup_request(request, cseq),
+							Method::Play => self.handle_play_request(request, cseq).await,
+							_ => unreachable!(),
+						}
+					},
 					Method::Describe => self.handle_describe_request(request, cseq).await,
 					Method::Options => self.handle_options_request(request, cseq),
-					Method::Setup => self.handle_setup_request(request, cseq),
-					Method::Play => self.handle_play_request(request, cseq).await,
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);
 						rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)

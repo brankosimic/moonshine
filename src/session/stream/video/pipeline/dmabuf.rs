@@ -294,6 +294,7 @@ pub(crate) struct DmaBufImporter {
 	retired: Vec<Arc<CachedImport>>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
+	failed: HashMap<RawFd, ImportParams>,
 }
 
 impl DmaBufImporter {
@@ -310,6 +311,7 @@ impl DmaBufImporter {
 			cache: HashMap::new(),
 			retired: Vec::new(),
 			calls_since_sweep: 0,
+			failed: HashMap::new(),
 		})
 	}
 
@@ -330,6 +332,15 @@ impl DmaBufImporter {
 		}
 
 		let params = ImportParams::new(width, height, format, planes);
+
+		if let Some(failed_params) = self.failed.get(&fd)
+			&& *failed_params == params
+		{
+			return Err(format!(
+				"DMA-BUF import previously failed for fd {fd} ({}x{}, format={:?}); not retrying",
+				width, height, format
+			));
+		}
 
 		// SAFETY: the caller keeps `fd` open for the duration of this call.
 		let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
@@ -352,6 +363,7 @@ impl DmaBufImporter {
 			stale.touch(now);
 			self.retired.push(stale);
 		}
+		self.failed.remove(&fd);
 
 		debug!(
 			"First import for fd {fd}: {}x{}, format={:?}, stride={}, modifier={:#x}",
@@ -365,7 +377,13 @@ impl DmaBufImporter {
 		let identity = Identity::read(self.method, owned_fd.as_fd())
 			.map_err(|e| format!("Failed to read DMA-BUF identity for the import cache: {e}"))?;
 
-		let (image, memory) = self.import_internal(width, height, format, planes)?;
+		let (image, memory) = match self.import_internal(width, height, format, planes) {
+			Ok(v) => v,
+			Err(e) => {
+				self.failed.insert(fd, params);
+				return Err(e);
+			},
+		};
 		let source = match SourceImage::new(&self.context, image, Handoff::External) {
 			Ok(source) => source,
 			Err(e) => {
@@ -514,10 +532,34 @@ impl DmaBufImporter {
 			memory_type_bits
 		);
 
-		let memory_type_index = self
+		let memory_type_index = match self
 			.context
 			.find_memory_type(memory_type_bits, vk::MemoryPropertyFlags::empty())
-			.ok_or_else(|| "No suitable memory type for DMA-BUF import".to_string())?;
+		{
+			Some(idx) => idx,
+			None => {
+				super::dmabuf_diag::diagnose_dmabuf_import_failure(
+					&self.context,
+					&super::dmabuf_diag::ImportDiag {
+						fd,
+						width,
+						height,
+						format,
+						modifier,
+						image_bits: mem_requirements.memory_type_bits,
+						fd_bits: memory_fd_properties.memory_type_bits,
+						size: mem_requirements.size,
+					},
+				);
+				return Err(format!(
+					"No suitable memory type for DMA-BUF import (image_bits={:#x}, fd_bits={:#x}, combined={:#x}, size={})",
+					mem_requirements.memory_type_bits,
+					memory_fd_properties.memory_type_bits,
+					memory_type_bits,
+					mem_requirements.size,
+				));
+			},
+		};
 
 		// Dedicated allocation (required by many drivers for external memory).
 		let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);

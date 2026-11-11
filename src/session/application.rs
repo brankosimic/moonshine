@@ -48,6 +48,10 @@ pub struct ApplicationConfig {
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
 
+	/// Whether this is a desktop (screen capture) session.
+	#[serde(default)]
+	pub desktop: bool,
+
 	/// Steam integration, equivalent to gamescope's `-e`: Steam chooses which
 	/// window is shown. Turn it on for Steam itself (Big Picture), so its
 	/// overlay and focus contract work; leave it off (the default) for anything
@@ -73,6 +77,7 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			desktop: false,
 			steam_integration: false,
 			env: BTreeMap::new(),
 		}
@@ -128,6 +133,7 @@ pub(crate) struct LaunchOptions<'a> {
 	pub post_commands: &'a Vec<Vec<String>>,
 	pub stdout_value: &'a Option<String>,
 	pub stderr_value: &'a Option<String>,
+	pub job_mode: &'static str,
 }
 
 /// Runtime context required to launch an application.
@@ -140,8 +146,7 @@ pub(crate) struct ApplicationContext {
 	pub xdisplay: u32,
 	/// Wayland socket name reported by the compositor.
 	pub wayland_display: String,
-	/// The compositor's environment for the application (see
-	/// `CompositorReady::env`).
+	/// Environment the hosted application needs (ferriscope's `Ready::env`).
 	pub compositor_env: Vec<(String, String)>,
 	/// Environment variables to pass on.
 	pub extra_env: HashMap<String, String>,
@@ -177,6 +182,8 @@ impl Application {
 		// Stop any leftover unit from a previous session.
 		let _ = stop_unit(&conn, &context.unit_name).await;
 
+		let job_mode = if is_plasma_session(program) { "fail" } else { "replace" };
+
 		// Launch the application as a transient systemd service unit.
 		let options = LaunchOptions {
 			unit_name: &context.unit_name,
@@ -188,6 +195,7 @@ impl Application {
 			post_commands: &config.post_command,
 			stdout_value: &config.stdout,
 			stderr_value: &config.stderr,
+			job_mode,
 		};
 
 		let unit_path = match start_transient_service(&conn, &options).await {
@@ -226,6 +234,11 @@ impl Drop for Application {
 	}
 }
 
+fn is_plasma_session(program: &str) -> bool {
+	let name = program.split('/').next_back().unwrap_or(program);
+	matches!(name, "startplasma-way" | "startplasma-wayland" | "plasmashell")
+}
+
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
 fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>) -> Result<Vec<String>, ()> {
 	// Build environment variables as "KEY=value" strings for systemd.
@@ -246,9 +259,6 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
-	// ferriscope's environment: the gamescope identity Steam uses for its
-	// external-overlay mode, the ferriscope-wsi layer, and the HDR and
-	// capability variables it actually backs.
 	for (key, value) in &context.compositor_env {
 		envs.push(format!("{key}={value}"));
 	}
@@ -647,7 +657,7 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 			SYSTEMD_PATH,
 			Some(SYSTEMD_MANAGER),
 			"StartTransientUnit",
-			&(options.unit_name, "replace", &properties, &aux),
+			&(options.unit_name, options.job_mode, &properties, &aux),
 		)
 		.await
 		.map_err(|e| tracing::warn!("Failed to start transient service: {e}"))?;
@@ -784,7 +794,7 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::{ApplicationConfig, ApplicationContext, make_envs, split_standard_io};
+	use super::{ApplicationConfig, ApplicationContext, is_plasma_session, make_envs, split_standard_io};
 	use std::collections::{BTreeMap, HashMap};
 	use std::path::PathBuf;
 
@@ -850,6 +860,22 @@ mod tests {
 			split_standard_io(&Some("fd:stdout".to_string())),
 			("fd".to_string(), Some(("FileDescriptorName", "stdout".to_string())))
 		);
+	}
+
+	#[test]
+	fn test_is_plasma_session_detects_plasma_binaries() {
+		assert!(is_plasma_session("/usr/bin/startplasma-way"));
+		assert!(is_plasma_session("/usr/bin/startplasma-wayland"));
+		assert!(is_plasma_session("/usr/bin/plasmashell"));
+		assert!(is_plasma_session("startplasma-way"));
+	}
+
+	#[test]
+	fn test_is_plasma_session_ignores_non_plasma() {
+		assert!(!is_plasma_session("/usr/bin/steam"));
+		assert!(!is_plasma_session("/usr/bin/wine"));
+		assert!(!is_plasma_session("/usr/bin/xdg-open"));
+		assert!(!is_plasma_session("cosmic-session"));
 	}
 
 	fn test_context() -> ApplicationContext {
