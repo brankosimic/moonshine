@@ -33,6 +33,8 @@ struct ApplicationManagerInner {
 	/// only the first one scans.
 	scanners: tokio::sync::Mutex<Vec<ApplicationScanner>>,
 
+	pre_command: Vec<Vec<String>>,
+
 	/// Configured and scanned applications as of the most recent scan.
 	catalog: RwLock<Vec<CatalogEntry>>,
 
@@ -44,8 +46,12 @@ impl ApplicationManager {
 	/// Create a manager and run the first scan.
 	///
 	/// Blocks while scanning, so call it before serving requests.
-	pub fn new(configured_applications: Vec<ApplicationConfig>, scanners: Vec<ApplicationScannerConfig>) -> Self {
-		Self::with_hidden(configured_applications, scanners, Vec::new())
+	pub fn new(
+		configured_applications: Vec<ApplicationConfig>,
+		scanners: Vec<ApplicationScannerConfig>,
+		pre_command: Vec<Vec<String>>,
+	) -> Self {
+		Self::with_hidden(configured_applications, scanners, Vec::new(), pre_command)
 	}
 
 	/// Create a manager whose scanned applications in `hidden` (by title) are hidden from clients,
@@ -56,18 +62,25 @@ impl ApplicationManager {
 		configured_applications: Vec<ApplicationConfig>,
 		scanners: Vec<ApplicationScannerConfig>,
 		hidden: Vec<String>,
+		pre_command: Vec<Vec<String>>,
 	) -> Self {
 		let sources = Sources {
 			configured_applications,
 			hidden: hidden.into_iter().collect(),
 		};
 		let mut scanners: Vec<ApplicationScanner> = scanners.into_iter().map(ApplicationScanner::new).collect();
-		let catalog = load_catalog(&sources.configured_applications, &mut scanners, &sources.hidden);
+		let catalog = load_catalog(
+			&sources.configured_applications,
+			&mut scanners,
+			&sources.hidden,
+			&pre_command,
+		);
 
 		Self {
 			inner: Arc::new(ApplicationManagerInner {
 				sources: RwLock::new(sources),
 				scanners: tokio::sync::Mutex::new(scanners),
+				pre_command,
 				catalog: RwLock::new(catalog),
 				scanned_at: RwLock::new(Some(SystemTime::now())),
 			}),
@@ -128,9 +141,15 @@ impl ApplicationManager {
 			.read()
 			.unwrap_or_else(PoisonError::into_inner)
 			.clone();
+		let pre_command = self.inner.pre_command.clone();
 		let mut scanned = scanners.clone();
 		match tokio::task::spawn_blocking(move || {
-			let catalog = load_catalog(&sources.configured_applications, &mut scanned, &sources.hidden);
+			let catalog = load_catalog(
+				&sources.configured_applications,
+				&mut scanned,
+				&sources.hidden,
+				&pre_command,
+			);
 			(catalog, scanned)
 		})
 		.await
@@ -227,7 +246,11 @@ mod tests {
 		let tempdir = tempdir().unwrap();
 		write_desktop_entry(tempdir.path(), "a.desktop", "Alpha");
 
-		let manager = ApplicationManager::new(Vec::new(), vec![desktop_scanner(tempdir.path().to_path_buf())]);
+		let manager = ApplicationManager::new(
+			Vec::new(),
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			Vec::new(),
+		);
 		assert_eq!(titles(&manager), ["Alpha"]);
 
 		sleep(Duration::from_millis(10));
@@ -246,7 +269,11 @@ mod tests {
 		let tempdir = tempdir().unwrap();
 		write_desktop_entry(tempdir.path(), "a.desktop", "Alpha");
 
-		let manager = ApplicationManager::new(Vec::new(), vec![desktop_scanner(tempdir.path().to_path_buf())]);
+		let manager = ApplicationManager::new(
+			Vec::new(),
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			Vec::new(),
+		);
 		let alpha = manager.applications().remove(0);
 
 		assert_eq!(manager.find(alpha.id()).map(|app| app.title), Some("Alpha".to_string()));
@@ -267,6 +294,7 @@ mod tests {
 			vec![configured],
 			vec![desktop_scanner(tempdir.path().to_path_buf())],
 			vec!["Alpha".to_string(), "Beta".to_string()],
+			Vec::new(),
 		);
 
 		// Only scanned applications can be hidden; the configured one keeps its title, so the
@@ -294,7 +322,11 @@ mod tests {
 			title: "Manual".to_string(),
 			..Default::default()
 		};
-		let manager = ApplicationManager::new(vec![configured], vec![desktop_scanner(tempdir.path().to_path_buf())]);
+		let manager = ApplicationManager::new(
+			vec![configured],
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			Vec::new(),
+		);
 
 		sleep(Duration::from_millis(10));
 		write_desktop_entry(tempdir.path(), "b.desktop", "Beta");

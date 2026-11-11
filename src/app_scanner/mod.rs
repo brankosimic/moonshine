@@ -244,6 +244,7 @@ pub(crate) fn load_catalog(
 	configured_applications: &[ApplicationConfig],
 	application_scanners: &mut [ApplicationScanner],
 	hidden: &HashSet<String>,
+	pre_command: &[Vec<String>],
 ) -> Vec<CatalogEntry> {
 	let scanned_applications = scan_applications_by_scanner(application_scanners, configured_applications);
 	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
@@ -253,6 +254,14 @@ pub(crate) fn load_catalog(
 		.chain(scanned_applications.iter().map(|(index, _)| Some(*index)))
 		.collect();
 	applications.extend(scanned_applications.into_iter().map(|(_, application)| application));
+	if !pre_command.is_empty() {
+		for application in &mut applications {
+			let mut merged = Vec::with_capacity(pre_command.len() + application.pre_command.len());
+			merged.extend_from_slice(pre_command);
+			merged.append(&mut application.pre_command);
+			application.pre_command = merged;
+		}
+	}
 	resolve_missing_boxart(&mut applications);
 
 	applications
@@ -394,5 +403,33 @@ mod tests {
 		let mut scanners = vec![lutris_scanner(db)];
 		assert!(scan_applications(&mut scanners, &[]).is_empty());
 		assert!(scanners[0].needs_reload());
+	}
+
+	#[test]
+	fn global_pre_commands_are_prepended_to_every_application() {
+		let tempdir = tempdir().unwrap();
+		write_desktop_entry(tempdir.path(), "game.desktop", "game");
+
+		let configured = ApplicationConfig {
+			title: "Manual".to_string(),
+			pre_command: vec![vec!["/bin/own".to_string()]],
+			..Default::default()
+		};
+		let mut scanners = vec![desktop_scanner(tempdir.path().to_path_buf())];
+		let global = vec![vec!["/bin/global".to_string()]];
+
+		let catalog = load_catalog(&[configured], &mut scanners, &HashSet::new(), &global);
+
+		let manual = catalog
+			.iter()
+			.find(|entry| entry.application.title == "Manual")
+			.unwrap();
+		assert_eq!(
+			manual.application.pre_command,
+			vec![vec!["/bin/global".to_string()], vec!["/bin/own".to_string()]]
+		);
+
+		let scanned = catalog.iter().find(|entry| entry.application.title == "Game").unwrap();
+		assert_eq!(scanned.application.pre_command, vec![vec!["/bin/global".to_string()]]);
 	}
 }

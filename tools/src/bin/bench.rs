@@ -711,6 +711,7 @@ async fn run_benchmark(
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
+		desktop: false,
 	};
 
 	tracing::info!("Initializing session...");
@@ -743,6 +744,7 @@ async fn run_benchmark(
 		max_reference_frames: 1,
 		full_range: false,
 		encrypt_video: false,
+		desktop_mode: false,
 	};
 
 	let audio_ctx = AudioStreamContext {
@@ -750,6 +752,7 @@ async fn run_benchmark(
 		qos: false,
 		audio_config: AudioConfig::default(),
 		encrypt_audio: false,
+		desktop: false,
 	};
 
 	tracing::info!("Setting stream contexts...");

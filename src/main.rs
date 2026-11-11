@@ -1,3 +1,4 @@
+use moonshine::desktop_streaming;
 use moonshine::healthcheck;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -61,7 +62,13 @@ async fn main() -> Result<(), ()> {
 	);
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
-	let config = Config::load_or_create(&config_path)?;
+	let mut config = Config::load_or_create(&config_path)?;
+
+	// Inject the "Desktop" app entry when desktop streaming is enabled
+	// (via `[stream] desktop = "On"` in the config, or "Auto" on a KDE
+	// Plasma Wayland session). Without this the app is never exposed in
+	// the applist that clients see.
+	desktop_streaming::inject_desktop_app(&mut config);
 
 	// The Vulkan objects every session and health check shares, so the Vulkan
 	// driver stays loaded for the whole process (see `moonshine::gpu`).
@@ -308,6 +315,7 @@ impl Moonshine {
 			config.applications.clone(),
 			config.application_scanners.clone(),
 			config.hidden_applications.clone(),
+			config.pre_command.clone(),
 		);
 		let webserver = Webserver::new(
 			config.name.clone(),
@@ -315,6 +323,7 @@ impl Moonshine {
 			config.stream.port,
 			config.webserver.clone(),
 			application_manager.clone(),
+			config.stream.desktop,
 			supported_codecs,
 			hdr_supported,
 			client_manager.persistent_state().get_uuid()?.to_string(),

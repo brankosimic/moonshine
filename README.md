@@ -163,6 +163,16 @@ Type it on the Clients page of the [control panel](#control-panel).
 You can also click the notification on the host, or open http://localhost:47989/pin .
 To pair without a browser, see [TIPS.md](TIPS.md#pair-a-client-from-the-command-line).
 
+### Global pre/post commands
+
+A top-level `pre_command` runs before launching any application, whether it comes from a `[[application]]` entry or an application scanner. It is prepended to each application's own `pre_command`:
+
+```toml
+pre_command = [
+    ["/usr/bin/systemctl", "--user", "stop", "llama-server"],
+]
+```
+
 ### Adding applications
 
 Each application runs in its own isolated streaming session. Add them in the control panel, or in `config.toml`:
