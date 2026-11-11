@@ -13,7 +13,17 @@ use self::gamepad::GamepadConfig;
 use self::remap::{HoldToHome, HoldTransition};
 use self::touch::{Pen, PenToolKind, PointerEventKind, Touch};
 use crate::session::compositor::input::{CompositorInput, scroll};
+use crate::session::desktop::input_event::DesktopInputEvent;
 use crate::session::manager::SessionShutdownReason;
+
+/// Where decoded input events are delivered.
+///
+/// A game forwards them to ferriscope's seat through [`CompositorInput`]; a
+/// desktop forwards them to the XDG portal over an mpsc channel.
+pub(crate) enum ControlInputSink {
+	Game(CompositorInput),
+	Desktop(std::sync::mpsc::Sender<DesktopInputEvent>),
+}
 
 use self::{
 	gamepad::{GamepadBattery, GamepadInfo, GamepadMotion, GamepadTouch, GamepadUpdate},
@@ -137,13 +147,13 @@ impl InputEvent {
 }
 
 pub(crate) struct InputHandler {
-	compositor: CompositorInput,
+	sink: ControlInputSink,
 	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 }
 
 impl InputHandler {
 	pub fn new(
-		compositor: CompositorInput,
+		sink: ControlInputSink,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
@@ -165,7 +175,7 @@ impl InputHandler {
 			});
 		});
 
-		Ok(Self { compositor, gamepad_tx })
+		Ok(Self { sink, gamepad_tx })
 	}
 
 	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
@@ -173,71 +183,151 @@ impl InputHandler {
 			InputEvent::KeyDown(key) => {
 				if let Some(code) = key.to_linux_keycode() {
 					tracing::trace!("Pressing key: {key:?} (keycode: {code})");
-					self.compositor.send(SeatEvent::Key { code, pressed: true });
+					self.dispatch_key(code, true);
 				}
 			},
 			InputEvent::KeyUp(key) => {
 				if let Some(code) = key.to_linux_keycode() {
 					tracing::trace!("Releasing key: {key:?} (keycode: {code})");
-					self.compositor.send(SeatEvent::Key { code, pressed: false });
+					self.dispatch_key(code, false);
 				}
 			},
 			InputEvent::MouseMoveAbsolute(event) => {
 				tracing::trace!("Absolute mouse movement: {event:?}");
-				self.compositor.send(self.compositor.pointer_motion(
-					event.x,
-					event.y,
-					event.screen_width,
-					event.screen_height,
-				));
+				match &self.sink {
+					ControlInputSink::Game(compositor) => {
+						compositor.send(compositor.pointer_motion(
+							event.x,
+							event.y,
+							event.screen_width,
+							event.screen_height,
+						));
+					},
+					ControlInputSink::Desktop(tx) => {
+						let _ = tx.send(DesktopInputEvent::MouseMoveAbsolute {
+							x: event.x,
+							y: event.y,
+							screen_width: event.screen_width,
+							screen_height: event.screen_height,
+						});
+					},
+				}
 			},
 			InputEvent::MouseMoveRelative(event) => {
 				tracing::trace!("Moving mouse relative: {event:?}");
-				self.compositor.send(SeatEvent::PointerMotionDelta {
-					dx: f64::from(event.x),
-					dy: f64::from(event.y),
-				});
+				match &self.sink {
+					ControlInputSink::Game(compositor) => {
+						compositor.send(SeatEvent::PointerMotionDelta {
+							dx: f64::from(event.x),
+							dy: f64::from(event.y),
+						});
+					},
+					ControlInputSink::Desktop(tx) => {
+						let _ = tx.send(DesktopInputEvent::MouseMoveRelative {
+							dx: event.x,
+							dy: event.y,
+						});
+					},
+				}
 			},
 			InputEvent::MouseButtonDown(button) => {
 				tracing::trace!("Pressing mouse button: {button:?}");
 				let code: u32 = button.into();
-				self.compositor.send(SeatEvent::PointerButton { code, pressed: true });
+				self.dispatch_button(code, true);
 			},
 			InputEvent::MouseButtonUp(button) => {
 				tracing::trace!("Releasing mouse button: {button:?}");
 				let code: u32 = button.into();
-				self.compositor.send(SeatEvent::PointerButton { code, pressed: false });
+				self.dispatch_button(code, false);
 			},
 			InputEvent::MouseScrollVertical(event) => {
 				tracing::trace!("Scrolling vertically: {event:?}");
-				self.compositor.send(scroll(event.amount, false));
+				match &self.sink {
+					ControlInputSink::Game(compositor) => compositor.send(scroll(event.amount, false)),
+					ControlInputSink::Desktop(tx) => {
+						let _ = tx.send(DesktopInputEvent::ScrollVertical { amount: event.amount });
+					},
+				}
 			},
 			InputEvent::MouseScrollHorizontal(event) => {
 				tracing::trace!("Scrolling horizontally: {event:?}");
-				self.compositor.send(scroll(event.amount, true));
+				match &self.sink {
+					ControlInputSink::Game(compositor) => compositor.send(scroll(event.amount, true)),
+					ControlInputSink::Desktop(tx) => {
+						let _ = tx.send(DesktopInputEvent::ScrollHorizontal { amount: event.amount });
+					},
+				}
 			},
 			InputEvent::Touch(event) => {
 				tracing::trace!("Touch input: {event:?}");
 				let slot = event.pointer_id;
-				let (x, y) = self.compositor.touch_point(event.x, event.y);
-				let seat_event = match event.event_kind {
-					PointerEventKind::Down => Some(SeatEvent::TouchDown { slot, x, y }),
-					PointerEventKind::Move => Some(SeatEvent::TouchMotion { slot, x, y }),
-					PointerEventKind::Up | PointerEventKind::Cancel => Some(SeatEvent::TouchUp { slot }),
-					PointerEventKind::CancelAll => Some(SeatEvent::TouchCancel),
-					PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => None,
-				};
-				if let Some(seat_event) = seat_event {
-					self.compositor.send_touch(seat_event);
+				match &self.sink {
+					ControlInputSink::Game(compositor) => {
+						let (x, y) = compositor.touch_point(event.x, event.y);
+						let seat_event = match event.event_kind {
+							PointerEventKind::Down => Some(SeatEvent::TouchDown { slot, x, y }),
+							PointerEventKind::Move => Some(SeatEvent::TouchMotion { slot, x, y }),
+							PointerEventKind::Up | PointerEventKind::Cancel => Some(SeatEvent::TouchUp { slot }),
+							PointerEventKind::CancelAll => Some(SeatEvent::TouchCancel),
+							PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => {
+								None
+							},
+						};
+						if let Some(seat_event) = seat_event {
+							compositor.send_touch(seat_event);
+						}
+					},
+					ControlInputSink::Desktop(tx) => {
+						let desktop_event = match event.event_kind {
+							PointerEventKind::Down => Some(DesktopInputEvent::TouchDown {
+								slot,
+								x: event.x,
+								y: event.y,
+							}),
+							PointerEventKind::Move => Some(DesktopInputEvent::TouchMove {
+								slot,
+								x: event.x,
+								y: event.y,
+							}),
+							PointerEventKind::Up | PointerEventKind::Cancel => {
+								Some(DesktopInputEvent::TouchUp { slot })
+							},
+							PointerEventKind::CancelAll => Some(DesktopInputEvent::TouchCancelAll),
+							PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => {
+								None
+							},
+						};
+						if let Some(de) = desktop_event {
+							let _ = tx.send(de);
+						}
+					},
 				}
 			},
 			InputEvent::Pen(event) => {
 				tracing::trace!("Pen input: {event:?}");
-				self.compositor.send(pen_event(&self.compositor, &event));
+				match &self.sink {
+					ControlInputSink::Game(compositor) => compositor.send(pen_event(compositor, &event)),
+					ControlInputSink::Desktop(tx) => {
+						let down = matches!(event.event_kind, PointerEventKind::Down | PointerEventKind::Move);
+						let _ = tx.send(DesktopInputEvent::Pen {
+							x: event.x,
+							y: event.y,
+							pressure: event.pressure_or_distance,
+							tilt_x: 0.0,
+							tilt_y: 0.0,
+							down,
+						});
+					},
+				}
 			},
 			InputEvent::Utf8Text(text) => {
 				tracing::trace!("Typing clipboard text.");
-				self.compositor.send(SeatEvent::Text(text));
+				match &self.sink {
+					ControlInputSink::Game(compositor) => compositor.send(SeatEvent::Text(text)),
+					ControlInputSink::Desktop(tx) => {
+						let _ = tx.send(DesktopInputEvent::TypeText { text });
+					},
+				}
 			},
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
@@ -248,6 +338,33 @@ impl InputHandler {
 			},
 		}
 		Ok(())
+	}
+
+	fn dispatch_key(&self, code: u32, pressed: bool) {
+		match &self.sink {
+			ControlInputSink::Game(compositor) => compositor.send(SeatEvent::Key { code, pressed }),
+			ControlInputSink::Desktop(tx) => {
+				let _ = tx.send(if pressed {
+					DesktopInputEvent::KeyDown { keycode: code }
+				} else {
+					DesktopInputEvent::KeyUp { keycode: code }
+				});
+			},
+		}
+	}
+
+	fn dispatch_button(&self, code: u32, pressed: bool) {
+		match &self.sink {
+			ControlInputSink::Game(compositor) => compositor.send(SeatEvent::PointerButton { code, pressed }),
+			ControlInputSink::Desktop(tx) => {
+				tracing::debug!(button = code, pressed, "Desktop mouse button event");
+				let _ = tx.send(if pressed {
+					DesktopInputEvent::MouseButtonDown { button: code }
+				} else {
+					DesktopInputEvent::MouseButtonUp { button: code }
+				});
+			},
+		}
 	}
 
 	pub async fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
@@ -636,6 +753,48 @@ mod tests {
 	fn rejects_empty_utf8_text_event() {
 		let payload = [0x17, 0x00, 0x00, 0x00];
 		assert!(InputEvent::from_bytes(&payload).is_err());
+	}
+
+	fn mouse_button_control_message(magic: u32, button: u8) -> Vec<u8> {
+		let mut input = Vec::new();
+		input.extend_from_slice(&8u32.to_be_bytes());
+		input.extend_from_slice(&magic.to_le_bytes());
+		input.push(button);
+		input.extend_from_slice(&[0u8; 3]);
+
+		let mut message = Vec::new();
+		message.extend_from_slice(&0x0206u16.to_le_bytes());
+		message.extend_from_slice(&(input.len() as u16).to_le_bytes());
+		message.extend_from_slice(&input);
+		message
+	}
+
+	#[test]
+	fn parses_mouse_button_press_and_release() {
+		for (magic, expected) in [(0x08u32, "down"), (0x09u32, "up")] {
+			let message = mouse_button_control_message(magic, 0x01);
+			let control = super::super::ControlMessage::from_bytes(&message).expect("control message should parse");
+			let super::super::ControlMessage::InputData(payload) = control else {
+				panic!("expected input data, got {control:?}");
+			};
+			match (expected, InputEvent::from_bytes(payload)) {
+				("down", Ok(InputEvent::MouseButtonDown(button))) => {
+					assert_eq!(button, super::MouseButton::Left);
+				},
+				("up", Ok(InputEvent::MouseButtonUp(button))) => {
+					assert_eq!(button, super::MouseButton::Left);
+				},
+				(other, result) => panic!("unexpected result for {other}: {result:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn mouse_buttons_map_to_linux_evdev_codes() {
+		use super::MouseButton;
+		assert_eq!(u32::from(MouseButton::Left), 0x110);
+		assert_eq!(u32::from(MouseButton::Right), 0x111);
+		assert_eq!(u32::from(MouseButton::Middle), 0x112);
 	}
 
 	fn pen(event_kind: super::PointerEventKind, tool_kind: super::PenToolKind) -> super::Pen {
