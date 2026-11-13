@@ -1,5 +1,7 @@
 [Unit]
 Description=Streaming server using the NVIDIA GameStream / Moonlight protocol.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=%i

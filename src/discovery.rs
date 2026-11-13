@@ -80,6 +80,19 @@ fn register(address: &str, port: u16, name: &str) -> Result<(ServiceDaemon, Stri
 	Ok((daemon, fullname))
 }
 
+fn is_container_interface(name: &str) -> bool {
+	const PREFIXES: &[&str] = &[
+		"docker", "veth", "virbr", "podman", "cni", "flannel", "vxlan", "lxc", "lxd", "kube",
+	];
+
+	if PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+		return true;
+	}
+
+	name.strip_prefix("br-")
+		.is_some_and(|id| id.len() == 12 && id.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn auto_service_interfaces(include_ipv6: bool) -> Vec<IfKind> {
 	let mut ipv4_indexes = Vec::new();
 	let mut ipv6_indexes = Vec::new();
@@ -87,7 +100,7 @@ fn auto_service_interfaces(include_ipv6: bool) -> Vec<IfKind> {
 	match network_interface::NetworkInterface::show() {
 		Ok(interfaces) => {
 			for interface in interfaces {
-				if interface.internal {
+				if interface.internal || is_container_interface(&interface.name) {
 					continue;
 				}
 
@@ -197,5 +210,25 @@ mod tests {
 	#[test]
 	fn hostname_falls_back_to_all() {
 		assert_eq!(advertise_mode("localhost"), Advertise::All);
+	}
+
+	#[test]
+	fn container_interfaces_are_skipped() {
+		assert!(is_container_interface("docker0"));
+		assert!(is_container_interface("docker_gwbridge"));
+		assert!(is_container_interface("br-a67e180cc1ad"));
+		assert!(is_container_interface("br-4a2ae2ed9b43"));
+		assert!(is_container_interface("veth57a976b"));
+		assert!(is_container_interface("virbr0"));
+		assert!(is_container_interface("podman0"));
+	}
+
+	#[test]
+	fn physical_and_user_bridges_are_kept() {
+		assert!(!is_container_interface("eno2"));
+		assert!(!is_container_interface("wlan0"));
+		assert!(!is_container_interface("br0"));
+		assert!(!is_container_interface("br-lan"));
+		assert!(!is_container_interface("br-deadbeef"));
 	}
 }
