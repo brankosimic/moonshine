@@ -24,6 +24,10 @@ pub struct DesktopApplicationScannerConfig {
 	/// Directories to scan recursively for `.desktop` files.
 	pub directories: Vec<PathBuf>,
 
+	/// Whether subdirectories of `directories` are scanned as well.
+	#[serde(default = "default_true")]
+	pub recursive: bool,
+
 	/// Whether terminal-based entries should be included.
 	#[serde(default = "default_false")]
 	pub include_terminal: bool,
@@ -82,6 +86,7 @@ pub(crate) fn scan_desktop_applications(
 
 		for entry in WalkDir::new(&directory)
 			.follow_links(true)
+			.max_depth(scan_depth(config))
 			.into_iter()
 			.filter_map(|entry| entry.ok())
 			.filter(|entry| entry.file_type().is_file())
@@ -120,11 +125,15 @@ pub(crate) fn source_fingerprint(config: &DesktopApplicationScannerConfig) -> So
 		.filter_map(|directory| expand_path(directory))
 		.collect();
 
-	fingerprint(&directories, usize::MAX, |path| {
+	fingerprint(&directories, scan_depth(config), |path| {
 		path.extension()
 			.and_then(|extension| extension.to_str())
 			.is_some_and(|extension| extension.eq_ignore_ascii_case("desktop"))
 	})
+}
+
+fn scan_depth(config: &DesktopApplicationScannerConfig) -> usize {
+	if config.recursive { usize::MAX } else { 1 }
 }
 
 fn parse_desktop_application(
@@ -708,6 +717,7 @@ mod tests {
 	fn scanner_config(directories: Vec<PathBuf>) -> DesktopApplicationScannerConfig {
 		DesktopApplicationScannerConfig {
 			directories,
+			recursive: true,
 			include_terminal: false,
 			resolve_icons: true,
 			pre_command: vec![],
@@ -738,6 +748,40 @@ Exec=/usr/bin/example --flag %U %%done
 		assert_eq!(applications.len(), 1);
 		assert_eq!(applications[0].title, "Moonshine Game");
 		assert_eq!(applications[0].command, vec!["/usr/bin/example", "--flag", "%done"]);
+	}
+
+	#[test]
+	fn non_recursive_scan_skips_subdirectories() {
+		let tempdir = tempdir().unwrap();
+		let app_dir = tempdir.path().join("applications");
+		write_file(
+			&app_dir.join("top.desktop"),
+			r#"
+[Desktop Entry]
+Type=Application
+Name=Top
+Exec=/usr/bin/top
+"#,
+		);
+		write_file(
+			&app_dir.join("nested").join("nested.desktop"),
+			r#"
+[Desktop Entry]
+Type=Application
+Name=Nested
+Exec=/usr/bin/nested
+"#,
+		);
+
+		let recursive = scanner_config(vec![app_dir.clone()]);
+		let applications = scan_desktop_applications(&recursive).unwrap();
+		assert_eq!(applications.len(), 2);
+
+		let mut non_recursive = scanner_config(vec![app_dir]);
+		non_recursive.recursive = false;
+		let applications = scan_desktop_applications(&non_recursive).unwrap();
+		assert_eq!(applications.len(), 1);
+		assert_eq!(applications[0].title, "Top");
 	}
 
 	#[test]

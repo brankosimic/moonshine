@@ -301,6 +301,7 @@ mod tests {
 	fn desktop_scanner(directory: PathBuf) -> ApplicationScanner {
 		ApplicationScanner::new(ApplicationScannerConfig::Desktop(DesktopApplicationScannerConfig {
 			directories: vec![directory],
+			recursive: true,
 			include_terminal: false,
 			resolve_icons: false,
 			pre_command: Vec::new(),
