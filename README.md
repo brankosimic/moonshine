@@ -306,7 +306,11 @@ directories = [
 ]
 include_terminal = false
 resolve_icons = true
+recursive = true
 ```
+
+Set `recursive = false` to only look for `.desktop` files directly inside the
+listed directories (default is `true`).
 
 **Lutris scanner** — finds all installed Lutris games:
 
